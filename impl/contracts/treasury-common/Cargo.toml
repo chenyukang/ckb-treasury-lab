@@ -1,0 +1,10 @@
+[package]
+name = "treasury-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ckb-hash.workspace = true
+merkle-cbt.workspace = true
+sparse-merkle-tree.workspace = true

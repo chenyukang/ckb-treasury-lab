@@ -1,7 +1,16 @@
 [workspace]
 resolver = "3"
 members = [
-  "contracts/vote-type-script"
+  "contracts/config-type-script",
+  "contracts/grant-lock-script",
+  "contracts/policy-type-script",
+  "contracts/proposal-type-script",
+  "contracts/tally-type-script",
+  "contracts/treasury-lock-script",
+  "contracts/treasury-common",
+  "contracts/vote-type-script",
+  "offchain/tally-builder",
+  "tests"
 ]
 
 [workspace.package]
@@ -12,6 +21,18 @@ description = "CKB vote system"
 homepage = "https://github.com/nervosnetwork"
 repository = "https://github.com/nervosnetwork"
 rust-version = "1.92.0"
+
+[workspace.dependencies]
+ckb-gen-types = { version = "1.1.0", default-features = false, features = ["calc-hash"] }
+ckb-hash = { version = "1.1.0", default-features = false, features = ["ckb-contract"] }
+ckb-jsonrpc-types = "1.2.0"
+ckb-std = { version = "1.1", features = ["type-id"] }
+merkle-cbt = { version = "0.3.2", default-features = false }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sparse-merkle-tree = { git = "https://github.com/nervosnetwork/sparse-merkle-tree.git", rev = "725cd69", default-features = false, features = ["with-blake2b-ref"] }
+treasury-common = { path = "contracts/treasury-common" }
 
 [profile.dev]
 panic = "abort"

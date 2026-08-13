@@ -1,0 +1,11 @@
+[package]
+name = "tally-type-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ckb-gen-types.workspace = true
+ckb-std.workspace = true
+merkle-cbt.workspace = true
+treasury-common.workspace = true

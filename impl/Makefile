@@ -49,7 +49,7 @@ build:
 	@set -eu; \
 	if [ "x$(CONTRACT)" = "x" ]; then \
 		for contract in $(wildcard contracts/*); do \
-			$(MAKE) -e -C $$contract build; \
+			if [ -f $$contract/Makefile ]; then $(MAKE) -e -C $$contract build; fi; \
 		done; \
 	else \
 		$(MAKE) -e -C contracts/$(CONTRACT) build; \
@@ -66,13 +66,17 @@ run:
 # test, check, clippy and fmt here are provided for completeness,
 # there is nothing wrong invoking cargo directly instead of make.
 test: build
+	cargo test -p treasury-common -p tally-builder -p contract-tests
 
 
 check:
 	cargo check $(CARGO_ARGS)
 
 clippy:
-	$(MAKE) -e -C contracts/vote-type-script clippy
+	cargo clippy -p treasury-common -p tally-builder -p contract-tests --all-targets -- -D warnings
+	@set -eu; for contract in $(wildcard contracts/*); do \
+		if [ -f $$contract/Makefile ]; then $(MAKE) -e -C $$contract clippy; fi; \
+	done
 
 # Arbitrary cargo command is supported here. For example:
 #

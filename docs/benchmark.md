@@ -1,4 +1,42 @@
-# Benchmark of Proposal Type Script
+# Treasury Voting Benchmarks
+
+## Optimistic batch settlement V1
+
+The implemented benchmark is the ignored test
+`contract_tests::tests::benchmark_tally_batch_cycles`. It creates independent
+voters, one DAO outpoint per voter, CBMT inclusion proofs for every VoteTx, and
+old/new proofs for all three SMTs. The builder-produced transaction then runs in
+CKB-VM through `ckb-testtool`.
+
+Run it with:
+
+```bash
+cd impl
+make build
+cargo test -p contract-tests benchmark_tally_batch_cycles -- --ignored --nocapture
+```
+
+Measured on Apple M2 Pro (`arm64`) with Rust 1.95.0 and the contract build's
+release profile plus debug assertions:
+
+| Independent votes | CKB-VM cycles | Cycles per vote | Batch witness | Settlement tx |
+|---:|---:|---:|---:|---:|
+| 1 | 3,253,229 | 3,253,229 | 670 B | 1,390 B |
+| 10 | 32,328,142 | 3,232,814 | 7,505 B | 8,225 B |
+| 50 | 163,068,826 | 3,261,376 | 41,111 B | 41,831 B |
+| 100 | 326,974,360 | 3,269,743 | 85,387 B | 86,107 B |
+
+The cost is approximately linear at 3.25M to 3.27M cycles per independent vote.
+At a 50M to 60M operational target, a batch should contain roughly 15 to 18
+independent votes. A 100-vote batch uses about 9.3% of CKB's default 3.5B block
+cycle limit and about 14.4% of the default 597,000-byte block limit. Cycles reach
+the chosen operational target before transaction bytes do.
+
+These figures are preliminary. Revote-heavy, multi-DAO-deposit, DAO-spend, and
+adversarial proof shapes still need separate measurements before production
+parameters are frozen.
+
+## Legacy node-scan proposal benchmark
 
 Unlike a normal script on CKB, the proposal type script needs to perform calculations over a large number of blocks, which could become a bottleneck. Hence we need to design a benchmark and measure it.
 
@@ -100,5 +138,4 @@ Results are as follows:
 
 It costs 2.1 seconds in total. Normalized to 1 day, that is 22.7 seconds (158.8 seconds for 7 days).
 Although this scenario is at maximum throughput, the processing time is significant. We need a plan to reduce the total workload.
-
 

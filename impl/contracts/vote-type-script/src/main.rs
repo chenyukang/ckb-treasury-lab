@@ -4,142 +4,136 @@
 ckb_std::entry!(program_entry);
 ckb_std::default_alloc!(16384, 1258306, 64);
 
-use ckb_gen_types::packed::Vote;
-use ckb_hash::new_blake2b;
 use ckb_std::{
     ckb_constants::Source,
-    high_level::{QueryIter, load_cell_capacity, load_cell_lock, load_cell_type, load_script},
+    ckb_types::prelude::Entity,
+    high_level::{
+        QueryIter, load_cell_capacity, load_cell_data, load_cell_lock_hash, load_cell_type,
+        load_cell_type_hash, load_input_out_point, load_script, load_transaction,
+    },
 };
-use molecule::prelude::{Entity, Reader};
-
-// Nervos DAO genesis type script (RFC 0024).
-const DAO_CODE_HASH: [u8; 32] = [
-    0x82, 0xd7, 0x6d, 0x1b, 0x75, 0xfe, 0x2f, 0xd9, 0xa2, 0x7d, 0xfb, 0xaa, 0x65, 0xa0, 0x39, 0x22,
-    0x1a, 0x38, 0x0d, 0x76, 0xc9, 0x26, 0xf3, 0x78, 0xd3, 0xf8, 0x1c, 0xf3, 0xe7, 0xe1, 0x3f, 0x2e,
-];
-const DAO_HASH_TYPE: u8 = 0x01;
+use treasury_common::{ProposalData, ProposalPhase, VoteData};
 
 #[repr(i8)]
 enum Error {
     ArgsInvalid = 1,
     ProposalNotFound,
+    ProposalNotOpen,
     VoterLockNotFound,
     VoteDataInvalid,
     DaoDepInvalid,
+    DuplicateDaoDep,
     AmountMismatch,
+    AmountBelowMinimum,
+    CapacityOverflow,
     MultipleVoteOutputs,
+    DaoSpentInVote,
 }
 
 pub fn program_entry() -> i8 {
     match run() {
         Ok(()) => 0,
-        Err(e) => e as i8,
+        Err(error) => error as i8,
     }
-}
-
-fn blake160(data: &[u8]) -> [u8; 20] {
-    let mut hash = [0u8; 32];
-    let mut b = new_blake2b();
-    b.update(data);
-    b.finalize(&mut hash);
-    let mut result = [0u8; 20];
-    result.copy_from_slice(&hash[..20]);
-    result
 }
 
 fn run() -> Result<(), Error> {
     let script = load_script().map_err(|_| Error::ArgsInvalid)?;
-    let args = script.args().raw_data().to_vec();
-    if args.len() != 20 {
-        return Err(Error::ArgsInvalid);
-    }
-    let expected_blake160: [u8; 20] = args[..20].try_into().unwrap();
+    let args = script.args().raw_data();
+    let proposal_type_hash: [u8; 32] = args.as_ref().try_into().map_err(|_| Error::ArgsInvalid)?;
 
-    // Determine action: zero group outputs = consumption (recycle CKB, always allow);
-    // exactly one = creation (cast a vote, validate below); more than one = invalid.
-    let group_output_count = QueryIter::new(load_cell_lock, Source::GroupOutput).count();
-    if group_output_count == 0 {
+    let output_count = QueryIter::new(load_cell_type_hash, Source::GroupOutput).count();
+    if output_count == 0 {
         return Ok(());
     }
-    // 3. Ensure that exactly one cell in the output contains this type script.
-    if group_output_count > 1 {
+    if output_count != 1 {
         return Err(Error::MultipleVoteOutputs);
     }
 
-    // 1. Find the proposal cell in cell_deps. Its type script's blake160 must match args[0..20].
-    let proposal_found = QueryIter::new(load_cell_type, Source::CellDep).any(|maybe_type_script| {
-        maybe_type_script
-            .as_ref()
-            .map(|type_script| blake160(type_script.as_slice()) == expected_blake160)
-            .unwrap_or(false)
-    });
-    if !proposal_found {
-        return Err(Error::ProposalNotFound);
-    }
-
-    let vote_lock = load_cell_lock(0, Source::GroupOutput).map_err(|_| Error::ArgsInvalid)?;
-
-    let vote_data = ckb_std::high_level::load_cell_data(0, Source::GroupOutput)
-        .map_err(|_| Error::VoteDataInvalid)?;
-
-    let vote = Vote::from_slice(&vote_data).map_err(|_| Error::VoteDataInvalid)?;
-    let vote_value = vote.as_reader().vote().as_slice()[0];
-    if vote_value != 0 && vote_value != 1 {
-        return Err(Error::VoteDataInvalid);
-    }
-
-    // 2. Find a lock on an input that matches the vote output lock; this proves DAO ownership.
-    let voter_lock_found = QueryIter::new(load_cell_lock, Source::Input)
-        .any(|input_lock| input_lock.as_slice() == vote_lock.as_slice());
-    if !voter_lock_found {
+    let proposal = find_open_proposal(proposal_type_hash)?;
+    let vote_lock_hash =
+        load_cell_lock_hash(0, Source::GroupOutput).map_err(|_| Error::VoteDataInvalid)?;
+    if !QueryIter::new(load_cell_lock_hash, Source::Input)
+        .any(|input_lock_hash| input_lock_hash == vote_lock_hash)
+    {
         return Err(Error::VoterLockNotFound);
     }
 
-    // 4. Each cell_dep index listed in dao_index must be a DAO deposit owned by the voter.
-    //    Sum their capacities and verify the total equals the amount field in the vote data.
-    let expected_amount = u64::from_le_bytes(
-        vote.as_reader()
-            .amount()
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::VoteDataInvalid)?,
-    );
-    let mut dao_dep_count: usize = 0;
-    let mut total_capacity: u64 = 0;
+    let vote_data = load_cell_data(0, Source::GroupOutput).map_err(|_| Error::VoteDataInvalid)?;
+    let vote = VoteData::decode(&vote_data).map_err(|_| Error::VoteDataInvalid)?;
+    if vote.dao_dep_indices.len() > proposal.max_dao_deps_per_vote as usize {
+        return Err(Error::VoteDataInvalid);
+    }
 
-    for dao_idx_reader in vote.as_reader().dao_index().iter() {
-        dao_dep_count += 1;
-        let dep_idx = u16::from_le_bytes(dao_idx_reader.as_slice().try_into().unwrap()) as usize;
+    let transaction = load_transaction().map_err(|_| Error::VoteDataInvalid)?;
+    let cell_deps = transaction.raw().cell_deps();
+    let spent_out_points =
+        QueryIter::new(load_input_out_point, Source::Input).collect::<alloc::vec::Vec<_>>();
+    let mut previous_index = None;
+    let mut total_capacity = 0u64;
+    for dep_index in vote.dao_dep_indices {
+        if previous_index.is_some_and(|previous| dep_index <= previous) {
+            return Err(Error::DuplicateDaoDep);
+        }
+        previous_index = Some(dep_index);
+        let dep_index = dep_index as usize;
+        let dep_out_point = cell_deps
+            .get(dep_index)
+            .ok_or(Error::DaoDepInvalid)?
+            .out_point();
+        if spent_out_points.contains(&dep_out_point) {
+            return Err(Error::DaoSpentInVote);
+        }
 
-        let dep_lock =
-            load_cell_lock(dep_idx, Source::CellDep).map_err(|_| Error::DaoDepInvalid)?;
-        let dep_type = load_cell_type(dep_idx, Source::CellDep)
+        let dep_lock_hash =
+            load_cell_lock_hash(dep_index, Source::CellDep).map_err(|_| Error::DaoDepInvalid)?;
+        if dep_lock_hash != vote_lock_hash {
+            return Err(Error::DaoDepInvalid);
+        }
+
+        let dep_type = load_cell_type(dep_index, Source::CellDep)
             .map_err(|_| Error::DaoDepInvalid)?
             .ok_or(Error::DaoDepInvalid)?;
-
-        if dep_lock.as_slice() != vote_lock.as_slice() {
-            return Err(Error::DaoDepInvalid);
-        }
-        if dep_type.code_hash().as_slice() != DAO_CODE_HASH {
-            return Err(Error::DaoDepInvalid);
-        }
-        if dep_type.hash_type().as_slice()[0] != DAO_HASH_TYPE {
-            return Err(Error::DaoDepInvalid);
-        }
-        if !dep_type.args().raw_data().is_empty() {
+        if dep_type.code_hash().as_slice() != proposal.dao_code_hash
+            || dep_type.hash_type().as_slice()[0] != proposal.dao_hash_type
+            || !dep_type.args().raw_data().is_empty()
+        {
             return Err(Error::DaoDepInvalid);
         }
 
-        let cap = load_cell_capacity(dep_idx, Source::CellDep).map_err(|_| Error::DaoDepInvalid)?;
-        total_capacity = total_capacity.saturating_add(cap);
+        let dep_data =
+            load_cell_data(dep_index, Source::CellDep).map_err(|_| Error::DaoDepInvalid)?;
+        if dep_data.as_slice() != [0u8; 8] {
+            return Err(Error::DaoDepInvalid);
+        }
+
+        total_capacity = total_capacity
+            .checked_add(
+                load_cell_capacity(dep_index, Source::CellDep).map_err(|_| Error::DaoDepInvalid)?,
+            )
+            .ok_or(Error::CapacityOverflow)?;
     }
-    if dao_dep_count == 0 || total_capacity == 0 {
-        return Err(Error::DaoDepInvalid);
-    }
 
-    if total_capacity != expected_amount {
+    if total_capacity != vote.amount {
         return Err(Error::AmountMismatch);
     }
-
+    if total_capacity < proposal.minimum_vote_capacity {
+        return Err(Error::AmountBelowMinimum);
+    }
     Ok(())
+}
+
+fn find_open_proposal(proposal_type_hash: [u8; 32]) -> Result<ProposalData, Error> {
+    for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
+        if type_hash == Some(proposal_type_hash) {
+            let data =
+                load_cell_data(index, Source::CellDep).map_err(|_| Error::ProposalNotOpen)?;
+            let proposal = ProposalData::decode(&data).map_err(|_| Error::ProposalNotOpen)?;
+            if proposal.phase != ProposalPhase::Open {
+                return Err(Error::ProposalNotOpen);
+            }
+            return Ok(proposal);
+        }
+    }
+    Err(Error::ProposalNotFound)
 }
