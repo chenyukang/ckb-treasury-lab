@@ -12,10 +12,10 @@ pub const TALLY_WITNESS_VERSION: u8 = 3;
 pub const VOTE_STATE_NAMESPACE: u8 = 0;
 pub const DAO_STATE_NAMESPACE: u8 = 1;
 pub const EVENT_STATE_NAMESPACE: u8 = 2;
-pub const PROPOSAL_DATA_LEN: usize = 281;
+pub const PROPOSAL_DATA_LEN: usize = 150;
 pub const TALLY_STATE_LEN: usize = 226;
 pub const RESULT_DATA_LEN: usize = 170;
-pub const POLICY_CONFIG_LEN: usize = 223;
+pub const PROPOSAL_CONFIG_LEN: usize = 223;
 pub const TREASURY_CONFIG_LEN: usize = 97;
 pub const EVENT_PRESENT: Hash = [
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -257,14 +257,7 @@ pub struct ProposalData {
     pub minimum_vote_capacity: u64,
     pub requested_amount: u64,
     pub receiver_lock_hash: Hash,
-    pub dao_code_hash: Hash,
-    pub dao_hash_type: u8,
-    pub vote_code_hash: Hash,
-    pub vote_hash_type: u8,
-    pub tally_code_hash: Hash,
-    pub tally_hash_type: u8,
-    pub policy_config_type_hash: Hash,
-    pub policy_type_hash: Hash,
+    pub proposal_config_type_hash: Hash,
     pub metadata_hash: Hash,
 }
 
@@ -289,14 +282,7 @@ impl ProposalData {
             minimum_vote_capacity: reader.u64()?,
             requested_amount: reader.u64()?,
             receiver_lock_hash: reader.hash()?,
-            dao_code_hash: reader.hash()?,
-            dao_hash_type: reader.u8()?,
-            vote_code_hash: reader.hash()?,
-            vote_hash_type: reader.u8()?,
-            tally_code_hash: reader.hash()?,
-            tally_hash_type: reader.u8()?,
-            policy_config_type_hash: reader.hash()?,
-            policy_type_hash: reader.hash()?,
+            proposal_config_type_hash: reader.hash()?,
             metadata_hash: reader.hash()?,
         };
         reader.finish()?;
@@ -309,10 +295,7 @@ impl ProposalData {
             || value.max_batch_witness_bytes == 0
             || value.minimum_vote_capacity == 0
             || value.requested_amount == 0
-            || value.policy_config_type_hash == [0; 32]
-            || !is_valid_script_hash_type(value.dao_hash_type)
-            || !is_valid_script_hash_type(value.vote_hash_type)
-            || !is_valid_script_hash_type(value.tally_hash_type)
+            || value.proposal_config_type_hash == [0; 32]
         {
             return Err(CodecError::InvalidValue);
         }
@@ -334,14 +317,7 @@ impl ProposalData {
         output.extend_from_slice(&self.minimum_vote_capacity.to_le_bytes());
         output.extend_from_slice(&self.requested_amount.to_le_bytes());
         output.extend_from_slice(&self.receiver_lock_hash);
-        output.extend_from_slice(&self.dao_code_hash);
-        output.push(self.dao_hash_type);
-        output.extend_from_slice(&self.vote_code_hash);
-        output.push(self.vote_hash_type);
-        output.extend_from_slice(&self.tally_code_hash);
-        output.push(self.tally_hash_type);
-        output.extend_from_slice(&self.policy_config_type_hash);
-        output.extend_from_slice(&self.policy_type_hash);
+        output.extend_from_slice(&self.proposal_config_type_hash);
         output.extend_from_slice(&self.metadata_hash);
         output
     }
@@ -427,7 +403,7 @@ pub struct ResultData {
     pub yes: u128,
     pub no: u128,
     pub final_state_hash: Hash,
-    pub policy_data_hash: Hash,
+    pub proposal_config_data_hash: Hash,
 }
 
 impl ResultData {
@@ -450,7 +426,7 @@ impl ResultData {
             yes: reader.u128()?,
             no: reader.u128()?,
             final_state_hash: reader.hash()?,
-            policy_data_hash: reader.hash()?,
+            proposal_config_data_hash: reader.hash()?,
         };
         reader.finish()?;
         Ok(value)
@@ -466,13 +442,13 @@ impl ResultData {
         output.extend_from_slice(&self.yes.to_le_bytes());
         output.extend_from_slice(&self.no.to_le_bytes());
         output.extend_from_slice(&self.final_state_hash);
-        output.extend_from_slice(&self.policy_data_hash);
+        output.extend_from_slice(&self.proposal_config_data_hash);
         output
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PolicyConfig {
+pub struct ProposalConfig {
     pub approval_bps: u16,
     pub minimum_total_votes: u128,
     pub maximum_proposal_amount: u64,
@@ -488,9 +464,9 @@ pub struct PolicyConfig {
     pub policy_type_hash: Hash,
 }
 
-impl PolicyConfig {
+impl ProposalConfig {
     pub fn decode(data: &[u8]) -> Result<Self, CodecError> {
-        if data.len() != POLICY_CONFIG_LEN {
+        if data.len() != PROPOSAL_CONFIG_LEN {
             return Err(CodecError::InvalidValue);
         }
         let mut reader = Reader::new(data);
@@ -532,7 +508,7 @@ impl PolicyConfig {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut output = Vec::with_capacity(POLICY_CONFIG_LEN);
+        let mut output = Vec::with_capacity(PROPOSAL_CONFIG_LEN);
         output.push(VERSION);
         output.extend_from_slice(&self.approval_bps.to_le_bytes());
         output.extend_from_slice(&self.minimum_total_votes.to_le_bytes());
@@ -1240,14 +1216,7 @@ mod tests {
             minimum_vote_capacity: 1,
             requested_amount: 1000,
             receiver_lock_hash: [1; 32],
-            dao_code_hash: [9; 32],
-            dao_hash_type: 1,
-            vote_code_hash: [2; 32],
-            vote_hash_type: 1,
-            tally_code_hash: [3; 32],
-            tally_hash_type: 1,
-            policy_config_type_hash: [6; 32],
-            policy_type_hash: [4; 32],
+            proposal_config_type_hash: [6; 32],
             metadata_hash: [5; 32],
         };
         assert_eq!(proposal.encode().len(), PROPOSAL_DATA_LEN);
@@ -1271,7 +1240,7 @@ mod tests {
         assert_eq!(tally.encode().len(), TALLY_STATE_LEN);
         assert_eq!(TallyState::decode(&tally.encode()).unwrap(), tally);
 
-        let policy = PolicyConfig {
+        let policy = ProposalConfig {
             approval_bps: 6000,
             minimum_total_votes: 100,
             maximum_proposal_amount: 1_000,
@@ -1286,8 +1255,8 @@ mod tests {
             tally_hash_type: 1,
             policy_type_hash: [13; 32],
         };
-        assert_eq!(policy.encode().len(), POLICY_CONFIG_LEN);
-        assert_eq!(PolicyConfig::decode(&policy.encode()).unwrap(), policy);
+        assert_eq!(policy.encode().len(), PROPOSAL_CONFIG_LEN);
+        assert_eq!(ProposalConfig::decode(&policy.encode()).unwrap(), policy);
 
         let treasury = TreasuryConfig {
             burn_expiry_blocks: 100,
@@ -1319,23 +1288,16 @@ mod tests {
             minimum_vote_capacity: 1,
             requested_amount: 1000,
             receiver_lock_hash: [1; 32],
-            dao_code_hash: [9; 32],
-            dao_hash_type: 1,
-            vote_code_hash: [2; 32],
-            vote_hash_type: 1,
-            tally_code_hash: [3; 32],
-            tally_hash_type: 1,
-            policy_config_type_hash: [6; 32],
-            policy_type_hash: [4; 32],
+            proposal_config_type_hash: [6; 32],
             metadata_hash: [5; 32],
         };
-        proposal.vote_hash_type = 3;
+        proposal.proposal_config_type_hash = [0; 32];
         assert_eq!(
             ProposalData::decode(&proposal.encode()),
             Err(CodecError::InvalidValue)
         );
 
-        let invalid_policy = PolicyConfig {
+        let invalid_policy = ProposalConfig {
             approval_bps: 6000,
             minimum_total_votes: 0,
             maximum_proposal_amount: 1_000,
@@ -1351,7 +1313,7 @@ mod tests {
             policy_type_hash: [13; 32],
         };
         assert_eq!(
-            PolicyConfig::decode(&invalid_policy.encode()),
+            ProposalConfig::decode(&invalid_policy.encode()),
             Err(CodecError::InvalidValue)
         );
 
@@ -1371,7 +1333,7 @@ mod tests {
 
     #[test]
     fn policy_uses_quorum_amount_cap_and_approval_ratio() {
-        let policy = PolicyConfig {
+        let policy = ProposalConfig {
             approval_bps: 6000,
             minimum_total_votes: 100,
             maximum_proposal_amount: 1_000,

@@ -7,8 +7,9 @@ use sparse_merkle_tree::{
 };
 use treasury_common::{
     BatchWitness, DAO_STATE_NAMESPACE, EVENT_PRESENT, EVENT_STATE_NAMESPACE, Hash, LeafTransition,
-    MergeHash, OutPoint, ProposalData, ProvenBlock, ProvenBlockTransaction, ProvenTransaction,
-    TallyPhase, TallyState, VOTE_STATE_NAMESPACE, VoteData, VoteRecord, namespaced_state_key,
+    MergeHash, OutPoint, ProposalConfig, ProposalData, ProvenBlock, ProvenBlockTransaction,
+    ProvenTransaction, TallyPhase, TallyState, VOTE_STATE_NAMESPACE, VoteData, VoteRecord,
+    namespaced_state_key,
 };
 
 mod rpc;
@@ -72,6 +73,7 @@ pub struct ScannedBatch {
 }
 
 pub struct TallyBuilder {
+    config: ProposalConfig,
     state: TallyState,
     committed_state: Smt,
     records: BTreeMap<Hash, VoteRecord>,
@@ -85,8 +87,14 @@ pub struct BlockTransactions {
 }
 
 impl TallyBuilder {
-    pub fn new(proposal_id: Hash, operator_lock_hash: Hash, start_block: u64) -> Self {
+    pub fn new(
+        proposal_id: Hash,
+        operator_lock_hash: Hash,
+        start_block: u64,
+        config: ProposalConfig,
+    ) -> Self {
         Self {
+            config,
             state: TallyState {
                 phase: TallyPhase::Active,
                 proposal_id,
@@ -123,7 +131,7 @@ impl TallyBuilder {
         for (index, raw_bytes) in block.raw_transactions.iter().enumerate() {
             let raw =
                 RawTransaction::from_slice(raw_bytes).map_err(|_| BuilderError::InvalidEvent)?;
-            if !view.is_relevant(proposal, &raw)? {
+            if !view.is_relevant(&raw)? {
                 continue;
             }
             let tx_index = index.try_into().map_err(|_| BuilderError::InvalidEvent)?;
@@ -196,7 +204,7 @@ impl TallyBuilder {
             for (index, raw_bytes) in block.raw_transactions.iter().enumerate().skip(start_index) {
                 let raw = RawTransaction::from_slice(raw_bytes)
                     .map_err(|_| BuilderError::InvalidEvent)?;
-                if !view.is_relevant(proposal, &raw)? {
+                if !view.is_relevant(&raw)? {
                     continue;
                 }
                 if event_count == proposal.max_events_per_batch as usize {
@@ -534,8 +542,8 @@ impl TallyBuilder {
             let Some(type_script) = output.type_().to_opt() else {
                 continue;
             };
-            if type_script.code_hash().as_slice() != proposal.vote_code_hash
-                || type_script.hash_type().as_slice()[0] != proposal.vote_hash_type
+            if type_script.code_hash().as_slice() != self.config.vote_code_hash
+                || type_script.hash_type().as_slice()[0] != self.config.vote_hash_type
                 || type_script.args().raw_data().as_ref() != self.state.proposal_id
             {
                 continue;
@@ -592,11 +600,7 @@ impl TallyBuilder {
         }
     }
 
-    fn is_relevant(
-        &self,
-        proposal: &ProposalData,
-        raw: &RawTransaction,
-    ) -> Result<bool, BuilderError> {
+    fn is_relevant(&self, raw: &RawTransaction) -> Result<bool, BuilderError> {
         for input in raw.inputs().into_iter() {
             let dao_key = state_key(
                 DAO_STATE_NAMESPACE,
@@ -608,8 +612,8 @@ impl TallyBuilder {
         }
         Ok(raw.outputs().into_iter().any(|output| {
             output.type_().to_opt().is_some_and(|script| {
-                script.code_hash().as_slice() == proposal.vote_code_hash
-                    && script.hash_type().as_slice()[0] == proposal.vote_hash_type
+                script.code_hash().as_slice() == self.config.vote_code_hash
+                    && script.hash_type().as_slice()[0] == self.config.vote_hash_type
                     && script.args().raw_data().as_ref() == self.state.proposal_id
             })
         }))
@@ -695,6 +699,7 @@ impl TallyBuilder {
 
     fn clone_builder(&self) -> Self {
         Self {
+            config: self.config,
             state: self.state.clone(),
             committed_state: clone_tree(&self.committed_state),
             records: self.records.clone(),
@@ -872,15 +877,26 @@ mod tests {
             minimum_vote_capacity: 1,
             requested_amount: 1000,
             receiver_lock_hash: [1; 32],
+            proposal_config_type_hash: [6; 32],
+            metadata_hash: [5; 32],
+        }
+    }
+
+    fn proposal_config() -> ProposalConfig {
+        ProposalConfig {
+            approval_bps: 6_000,
+            minimum_total_votes: 1,
+            maximum_proposal_amount: 1_000,
+            treasury_lock_hash: [1; 32],
             dao_code_hash: [9; 32],
             dao_hash_type: 1,
+            proposal_code_hash: [10; 32],
+            proposal_hash_type: 1,
             vote_code_hash: [2; 32],
             vote_hash_type: 1,
             tally_code_hash: [3; 32],
             tally_hash_type: 1,
-            policy_config_type_hash: [6; 32],
             policy_type_hash: [4; 32],
-            metadata_hash: [5; 32],
         }
     }
 
@@ -1015,7 +1031,7 @@ mod tests {
     #[test]
     fn new_builder_matches_proposal_start() {
         let proposal = proposal();
-        let builder = TallyBuilder::new([7; 32], [8; 32], proposal.start_block);
+        let builder = TallyBuilder::new([7; 32], [8; 32], proposal.start_block, proposal_config());
         assert_eq!(builder.state().next_block, proposal.start_block);
         assert_eq!(builder.state().votes_root, ZERO);
     }
@@ -1023,7 +1039,8 @@ mod tests {
     #[test]
     fn empty_final_batch_preserves_roots_and_tally() {
         let proposal = proposal();
-        let mut builder = TallyBuilder::new([7; 32], [8; 32], proposal.start_block);
+        let mut builder =
+            TallyBuilder::new([7; 32], [8; 32], proposal.start_block, proposal_config());
         let (state, batch) = builder
             .build_batch(
                 &proposal,
@@ -1045,7 +1062,12 @@ mod tests {
         let mut proposal = proposal();
         proposal.end_block = 11;
         let proposal_id = [7; 32];
-        let builder = TallyBuilder::new(proposal_id, [8; 32], proposal.start_block);
+        let builder = TallyBuilder::new(
+            proposal_id,
+            [8; 32],
+            proposal.start_block,
+            proposal_config(),
+        );
         let (vote, spend) = vote_and_spend_transactions(proposal_id);
         let scanned = builder
             .scan_blocks(
@@ -1103,7 +1125,12 @@ mod tests {
             index: 0,
         };
 
-        let mut omitted_builder = TallyBuilder::new(proposal_id, [8; 32], proposal.start_block);
+        let mut omitted_builder = TallyBuilder::new(
+            proposal_id,
+            [8; 32],
+            proposal.start_block,
+            proposal_config(),
+        );
         omitted_builder
             .build_batch(
                 &proposal,
@@ -1119,7 +1146,12 @@ mod tests {
                 .is_ok()
         );
 
-        let mut complete_builder = TallyBuilder::new(proposal_id, [8; 32], proposal.start_block);
+        let mut complete_builder = TallyBuilder::new(
+            proposal_id,
+            [8; 32],
+            proposal.start_block,
+            proposal_config(),
+        );
         complete_builder
             .build_batch(
                 &proposal,

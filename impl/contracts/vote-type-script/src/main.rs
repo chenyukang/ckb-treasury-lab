@@ -12,7 +12,7 @@ use ckb_std::{
         load_cell_type_hash, load_input_out_point, load_script, load_transaction,
     },
 };
-use treasury_common::{PolicyConfig, ProposalData, ProposalPhase, VoteData};
+use treasury_common::{ProposalConfig, ProposalData, ProposalPhase, VoteData};
 
 #[repr(i8)]
 enum Error {
@@ -56,13 +56,6 @@ fn run() -> Result<(), Error> {
     let (proposal, config) = find_open_proposal(proposal_type_hash)?;
     if script.code_hash().as_slice() != config.vote_code_hash
         || script.hash_type().as_slice()[0] != config.vote_hash_type
-        || proposal.dao_code_hash != config.dao_code_hash
-        || proposal.dao_hash_type != config.dao_hash_type
-        || proposal.vote_code_hash != config.vote_code_hash
-        || proposal.vote_hash_type != config.vote_hash_type
-        || proposal.tally_code_hash != config.tally_code_hash
-        || proposal.tally_hash_type != config.tally_hash_type
-        || proposal.policy_type_hash != config.policy_type_hash
     {
         return Err(Error::ContractIdentityMismatch);
     }
@@ -138,17 +131,19 @@ fn run() -> Result<(), Error> {
     Ok(())
 }
 
-fn load_policy_config(config_type_hash: [u8; 32]) -> Result<PolicyConfig, Error> {
+fn load_proposal_config(config_type_hash: [u8; 32]) -> Result<ProposalConfig, Error> {
     for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
         if type_hash == Some(config_type_hash) {
             let data = load_cell_data(index, Source::CellDep).map_err(|_| Error::ConfigInvalid)?;
-            return PolicyConfig::decode(&data).map_err(|_| Error::ConfigInvalid);
+            return ProposalConfig::decode(&data).map_err(|_| Error::ConfigInvalid);
         }
     }
     Err(Error::ConfigNotFound)
 }
 
-fn find_open_proposal(proposal_type_hash: [u8; 32]) -> Result<(ProposalData, PolicyConfig), Error> {
+fn find_open_proposal(
+    proposal_type_hash: [u8; 32],
+) -> Result<(ProposalData, ProposalConfig), Error> {
     for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
         if type_hash == Some(proposal_type_hash) {
             let type_script = load_cell_type(index, Source::CellDep)
@@ -160,7 +155,7 @@ fn find_open_proposal(proposal_type_hash: [u8; 32]) -> Result<(ProposalData, Pol
             if proposal.phase != ProposalPhase::Open {
                 return Err(Error::ProposalNotOpen);
             }
-            let config = load_policy_config(proposal.policy_config_type_hash)?;
+            let config = load_proposal_config(proposal.proposal_config_type_hash)?;
             if type_script.code_hash().as_slice() != config.proposal_code_hash
                 || type_script.hash_type().as_slice()[0] != config.proposal_hash_type
             {

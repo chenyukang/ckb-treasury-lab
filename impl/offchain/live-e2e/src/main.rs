@@ -22,7 +22,7 @@ use tally_builder::{
     prove_transaction,
 };
 use treasury_common::{
-    Hash, PolicyConfig, ProposalData, ProposalPhase, ResultData, TallyWitness, TreasuryConfig,
+    Hash, ProposalConfig, ProposalData, ProposalPhase, ResultData, TallyWitness, TreasuryConfig,
     VoteData, blake2b_256,
 };
 
@@ -285,12 +285,12 @@ fn run() -> AnyResult<()> {
     let config_code_hash = *code_hashes.get("config").unwrap();
     let policy_code_hash = *code_hashes.get("policy").unwrap();
     let treasury_code_hash = *code_hashes.get("treasury").unwrap();
-    let policy_config_type = script(config_code_hash, DATA1_HASH_TYPE, &[0x41; 32]);
+    let proposal_config_type = script(config_code_hash, DATA1_HASH_TYPE, &[0x41; 32]);
     let treasury_config_type = script(config_code_hash, DATA1_HASH_TYPE, &[0x42; 32]);
     let policy_script = script(
         policy_code_hash,
         DATA1_HASH_TYPE,
-        &packed_hash(&policy_config_type.calc_script_hash()),
+        &packed_hash(&proposal_config_type.calc_script_hash()),
     );
     let genesis_input = packed::CellInput::new_cellbase_input(0);
     let mut type_id_code_hash = [0; 32];
@@ -311,7 +311,7 @@ fn run() -> AnyResult<()> {
         &packed_hash(&treasury_config_type.calc_script_hash()),
     );
     let zero_lock = script(always_code_hash, DATA_HASH_TYPE, &[0]);
-    let policy_config = PolicyConfig {
+    let proposal_config = ProposalConfig {
         approval_bps: 6_000,
         minimum_total_votes: 2_000 * CKB as u128,
         maximum_proposal_amount: 1_000 * CKB,
@@ -347,8 +347,8 @@ fn run() -> AnyResult<()> {
         &source_spec,
         &binaries,
         &treasury_lock,
-        &policy_config_type,
-        &policy_config,
+        &proposal_config_type,
+        &proposal_config,
         &treasury_config_type,
         &treasury_config,
         always_code_hash,
@@ -397,7 +397,7 @@ fn run() -> AnyResult<()> {
         &[],
     );
     if deployed_dao_type != dao_type {
-        return Err(other("genesis DAO Type Script differs from PolicyConfig"));
+        return Err(other("genesis DAO Type Script differs from ProposalConfig"));
     }
 
     let proposer_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x01]);
@@ -414,9 +414,9 @@ fn run() -> AnyResult<()> {
     let vote2_funding = find_cell(&cells, &voter2_lock, 500 * CKB)?;
     let omitted_bond_funding = find_cell(&cells, &operator_lock, 2_000 * CKB)?;
     let complete_bond_funding = find_cell(&cells, &operator_lock, 2_100 * CKB)?;
-    let policy_config_cell = cells
+    let proposal_config_cell = cells
         .iter()
-        .find(|cell| cell.output.type_().to_opt().as_ref() == Some(&policy_config_type))
+        .find(|cell| cell.output.type_().to_opt().as_ref() == Some(&proposal_config_type))
         .cloned()
         .ok_or_else(|| other("policy config cell is missing"))?;
     let treasury_config_cell = cells
@@ -496,14 +496,7 @@ fn run() -> AnyResult<()> {
         minimum_vote_capacity: 500 * CKB,
         requested_amount: 100 * CKB,
         receiver_lock_hash: packed_hash(&receiver_lock.calc_script_hash()),
-        dao_code_hash: packed_hash(&dao_type.code_hash()),
-        dao_hash_type: TYPE_HASH_TYPE,
-        vote_code_hash: *code_hashes.get("vote").unwrap(),
-        vote_hash_type: DATA1_HASH_TYPE,
-        tally_code_hash: *code_hashes.get("tally").unwrap(),
-        tally_hash_type: DATA1_HASH_TYPE,
-        policy_config_type_hash: packed_hash(&policy_config_type.calc_script_hash()),
-        policy_type_hash: packed_hash(&policy_script.calc_script_hash()),
+        proposal_config_type_hash: packed_hash(&proposal_config_type.calc_script_hash()),
         metadata_hash: blake2b_256(b"live E2E proposal"),
     };
     let proposal_tx = transaction(
@@ -511,7 +504,7 @@ fn run() -> AnyResult<()> {
         vec![
             code_dep(&code_cells.always),
             code_dep(&code_cells.proposal),
-            code_dep(&policy_config_cell.out_point),
+            code_dep(&proposal_config_cell.out_point),
         ],
         vec![],
         vec![output(
@@ -546,7 +539,7 @@ fn run() -> AnyResult<()> {
         &voter1_lock,
         &vote_type,
         &open_proposal_cell,
-        &policy_config_cell,
+        &proposal_config_cell,
         &dao1_cell,
         1_000 * CKB,
     )?;
@@ -558,7 +551,7 @@ fn run() -> AnyResult<()> {
         &voter2_lock,
         &vote_type,
         &open_proposal_cell,
-        &policy_config_cell,
+        &proposal_config_cell,
         &dao2_cell,
         1_100 * CKB,
     )?;
@@ -605,6 +598,8 @@ fn run() -> AnyResult<()> {
         &closed_proposal_cell,
         &closed_proposal,
         proposal_id,
+        &proposal_config_cell,
+        proposal_config,
     )?;
     let (omitted_tally_type, omitted_tally_cell, mut omitted_builder) = omitted_session;
     let (omitted_blocks, omitted_headers) =
@@ -622,6 +617,7 @@ fn run() -> AnyResult<()> {
     let omitted_advance = tally_advance_tx(
         &code_cells,
         &closed_proposal_cell,
+        &proposal_config_cell,
         &omitted_tally_cell,
         &operator_lock,
         &omitted_tally_type,
@@ -664,6 +660,7 @@ fn run() -> AnyResult<()> {
             code_dep(&code_cells.always),
             code_dep(&code_cells.tally),
             code_dep(&closed_proposal_cell.out_point),
+            code_dep(&proposal_config_cell.out_point),
         ],
         vec![omitted_vote_block.block_hash],
         vec![output(
@@ -692,6 +689,8 @@ fn run() -> AnyResult<()> {
         &closed_proposal_cell,
         &closed_proposal,
         proposal_id,
+        &proposal_config_cell,
+        proposal_config,
     )?;
     let (complete_tally_type, complete_tally_cell, mut complete_builder) = complete_session;
     let scanned = map_builder(
@@ -717,6 +716,7 @@ fn run() -> AnyResult<()> {
     let complete_advance = tally_advance_tx(
         &code_cells,
         &closed_proposal_cell,
+        &proposal_config_cell,
         &complete_tally_cell,
         &operator_lock,
         &complete_tally_type,
@@ -736,7 +736,7 @@ fn run() -> AnyResult<()> {
 
     let challenge_deadline = complete_candidate.candidate_since + closed_proposal.challenge_period;
     rpc.mine_to(challenge_deadline)?;
-    let passed = policy_config.passes(
+    let passed = proposal_config.passes(
         complete_candidate.yes,
         complete_candidate.no,
         closed_proposal.requested_amount,
@@ -754,7 +754,7 @@ fn run() -> AnyResult<()> {
         yes: complete_candidate.yes,
         no: complete_candidate.no,
         final_state_hash: blake2b_256(&complete_candidate.encode()),
-        policy_data_hash: blake2b_256(&policy_config.encode()),
+        proposal_config_data_hash: blake2b_256(&proposal_config.encode()),
     };
     let finalize_tx = transaction(
         vec![
@@ -766,7 +766,7 @@ fn run() -> AnyResult<()> {
             code_dep(&code_cells.proposal),
             code_dep(&code_cells.tally),
             code_dep(&code_cells.policy),
-            code_dep(&policy_config_cell.out_point),
+            code_dep(&proposal_config_cell.out_point),
         ],
         vec![rpc.block_hash(challenge_deadline)?],
         vec![
@@ -809,7 +809,7 @@ fn run() -> AnyResult<()> {
             code_dep(&code_cells.treasury),
             code_dep(&code_cells.policy),
             code_dep(&treasury_config_cell.out_point),
-            code_dep(&policy_config_cell.out_point),
+            code_dep(&proposal_config_cell.out_point),
         ],
         vec![],
         vec![
@@ -913,8 +913,8 @@ fn write_chain_spec(
     path: &Path,
     binaries: &BTreeMap<String, PathBuf>,
     treasury_lock: &packed::Script,
-    policy_config_type: &packed::Script,
-    policy_config: &PolicyConfig,
+    proposal_config_type: &packed::Script,
+    proposal_config: &ProposalConfig,
     treasury_config_type: &packed::Script,
     treasury_config: &TreasuryConfig,
     always_code_hash: Hash,
@@ -983,8 +983,8 @@ fn write_chain_spec(
         &mut spec,
         1_000 * CKB,
         &script(always_code_hash, DATA_HASH_TYPE, &[0x40]),
-        policy_config_type,
-        &policy_config.encode(),
+        proposal_config_type,
+        &proposal_config.encode(),
     )?;
     append_issued_typed(
         &mut spec,
@@ -1223,7 +1223,7 @@ fn submit_vote(
     voter_lock: &packed::Script,
     vote_type: &packed::Script,
     proposal: &CellRef,
-    policy_config: &CellRef,
+    proposal_config: &CellRef,
     dao: &CellRef,
     amount: u64,
 ) -> AnyResult<Commit> {
@@ -1240,7 +1240,7 @@ fn submit_vote(
             code_dep(&code.always),
             code_dep(&code.vote),
             code_dep(&proposal.out_point),
-            code_dep(&policy_config.out_point),
+            code_dep(&proposal_config.out_point),
             code_dep(&dao.out_point),
         ],
         vec![],
@@ -1266,11 +1266,18 @@ fn create_tally_session(
     proposal_cell: &CellRef,
     proposal: &ProposalData,
     proposal_id: Hash,
+    proposal_config_cell: &CellRef,
+    proposal_config: ProposalConfig,
 ) -> AnyResult<(packed::Script, CellRef, TallyBuilder)> {
     let tally_input = input(&funding.out_point);
     let tally_type = script(tally_code_hash, DATA1_HASH_TYPE, &type_id(&tally_input, 0));
     let operator_hash = packed_hash(&operator_lock.calc_script_hash());
-    let builder = TallyBuilder::new(proposal_id, operator_hash, proposal.start_block);
+    let builder = TallyBuilder::new(
+        proposal_id,
+        operator_hash,
+        proposal.start_block,
+        proposal_config,
+    );
     let initial = builder.state().clone();
     let tx = transaction(
         vec![tally_input],
@@ -1278,6 +1285,7 @@ fn create_tally_session(
             code_dep(&code.always),
             code_dep(&code.tally),
             code_dep(&proposal_cell.out_point),
+            code_dep(&proposal_config_cell.out_point),
         ],
         vec![],
         vec![output(
@@ -1359,6 +1367,7 @@ fn push_header(headers: &mut Vec<Hash>, hash: Hash) -> AnyResult<u16> {
 fn tally_advance_tx(
     code: &CodeCells,
     proposal: &CellRef,
+    proposal_config: &CellRef,
     tally: &CellRef,
     operator_lock: &packed::Script,
     tally_type: &packed::Script,
@@ -1372,6 +1381,7 @@ fn tally_advance_tx(
             code_dep(&code.always),
             code_dep(&code.tally),
             code_dep(&proposal.out_point),
+            code_dep(&proposal_config.out_point),
         ],
         header_deps,
         vec![output(

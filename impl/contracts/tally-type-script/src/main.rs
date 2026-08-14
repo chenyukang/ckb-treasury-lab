@@ -10,15 +10,15 @@ use ckb_std::{
     ckb_constants::Source,
     high_level::{
         QueryIter, load_cell_capacity, load_cell_data, load_cell_lock_hash, load_cell_type,
-        load_cell_type_hash, load_header, load_witness_args,
+        load_cell_type_hash, load_header, load_script, load_witness_args,
     },
     type_id::check_type_id,
 };
 use treasury_common::{
     BatchWitness, DAO_STATE_NAMESPACE, EVENT_PRESENT, EVENT_STATE_NAMESPACE, Hash, LeafTransition,
-    OutPoint, ProposalData, ProposalPhase, ProvenBlock, ProvenTransaction, TallyPhase, TallyState,
-    TallyWitness, VOTE_STATE_NAMESPACE, VoteData, VoteRecord, cbmt_multi_root,
-    namespaced_state_key, transactions_root, verify_smt_transition,
+    OutPoint, ProposalConfig, ProposalData, ProposalPhase, ProvenBlock, ProvenTransaction,
+    TallyPhase, TallyState, TallyWitness, VOTE_STATE_NAMESPACE, VoteData, VoteRecord,
+    cbmt_multi_root, namespaced_state_key, transactions_root, verify_smt_transition,
 };
 
 const ZERO: Hash = [0; 32];
@@ -47,6 +47,9 @@ enum Error {
     ChallengeInvalid,
     ChallengePeriodOpen,
     BondOutputInvalid,
+    ConfigNotFound,
+    ConfigInvalid,
+    ContractIdentityMismatch,
 }
 
 pub fn program_entry() -> i8 {
@@ -73,7 +76,8 @@ fn run() -> Result<(), Error> {
 
 fn create() -> Result<(), Error> {
     let state = load_state(0, Source::GroupOutput)?;
-    let proposal = load_proposal_dep(state.proposal_id)?;
+    let (proposal, config) = load_proposal_dep(state.proposal_id)?;
+    ensure_tally_identity(&config)?;
     if proposal.phase != ProposalPhase::Closed
         || state.phase != TallyPhase::Active
         || state.sequence != 0
@@ -112,7 +116,8 @@ fn advance() -> Result<(), Error> {
         return Err(Error::BondChanged);
     }
     require_operator(input.operator_lock_hash)?;
-    let proposal = load_proposal_dep(input.proposal_id)?;
+    let (proposal, config) = load_proposal_dep(input.proposal_id)?;
+    ensure_tally_identity(&config)?;
     let (witness, witness_len) = load_tally_witness()?;
     if witness_len > proposal.max_batch_witness_bytes as usize {
         return Err(Error::BatchLimit);
@@ -120,7 +125,7 @@ fn advance() -> Result<(), Error> {
     let TallyWitness::Advance(batch) = witness else {
         return Err(Error::WitnessInvalid);
     };
-    verify_batch(&input, &output, &proposal, &batch)
+    verify_batch(&input, &output, &proposal, &config, &batch)
 }
 
 fn consume() -> Result<(), Error> {
@@ -133,7 +138,18 @@ fn consume() -> Result<(), Error> {
             challenger_lock_hash,
             omitted,
             event_proof,
-        } => challenge_vote(&state, challenger_lock_hash, &omitted, &event_proof),
+        } => {
+            let (proposal, config) = load_proposal_dep(state.proposal_id)?;
+            ensure_tally_identity(&config)?;
+            challenge_vote(
+                &state,
+                &proposal,
+                &config,
+                challenger_lock_hash,
+                &omitted,
+                &event_proof,
+            )
+        }
         TallyWitness::ChallengeSpend {
             challenger_lock_hash,
             omitted_spend,
@@ -141,16 +157,25 @@ fn consume() -> Result<(), Error> {
             voter_lock_hash,
             event_proof,
             dao_proof,
-        } => challenge_spend(
-            &state,
-            challenger_lock_hash,
-            &omitted_spend,
-            dao_out_point,
-            voter_lock_hash,
-            &event_proof,
-            &dao_proof,
-        ),
-        TallyWitness::Finalize => finalize(&state),
+        } => {
+            let (proposal, config) = load_proposal_dep(state.proposal_id)?;
+            ensure_tally_identity(&config)?;
+            ensure_in_voting_window(&omitted_spend, &proposal)?;
+            challenge_spend(
+                &state,
+                challenger_lock_hash,
+                &omitted_spend,
+                dao_out_point,
+                voter_lock_hash,
+                &event_proof,
+                &dao_proof,
+            )
+        }
+        TallyWitness::Finalize => {
+            let (proposal, config) = load_proposal_input(state.proposal_id)?;
+            ensure_tally_identity(&config)?;
+            finalize(&state, &proposal)
+        }
         TallyWitness::Advance(_) => Err(Error::WitnessInvalid),
     }
 }
@@ -159,6 +184,7 @@ fn verify_batch(
     input: &TallyState,
     output: &TallyState,
     proposal: &ProposalData,
+    config: &ProposalConfig,
     batch: &BatchWitness,
 ) -> Result<(), Error> {
     let event_count = batch.event_count().ok_or(Error::BatchLimit)?;
@@ -287,7 +313,7 @@ fn verify_batch(
                 let Some(type_script) = output_cell.type_().to_opt() else {
                     continue;
                 };
-                if !is_vote_script(&type_script, proposal, input.proposal_id) {
+                if !is_vote_script(&type_script, config, input.proposal_id) {
                     continue;
                 }
                 let output_data = raw
@@ -387,18 +413,19 @@ fn verify_proven_block(
 
 fn challenge_vote(
     state: &TallyState,
+    proposal: &ProposalData,
+    config: &ProposalConfig,
     challenger: Hash,
     omitted: &ProvenTransaction,
     proof: &[u8],
 ) -> Result<(), Error> {
-    let proposal = load_proposal_dep(state.proposal_id)?;
-    ensure_in_voting_window(omitted, &proposal)?;
+    ensure_in_voting_window(omitted, proposal)?;
     let (raw, tx_hash) = verify_proven_transaction(omitted)?;
     let has_vote = raw.outputs().into_iter().any(|output| {
         output
             .type_()
             .to_opt()
-            .is_some_and(|script| is_vote_script(&script, &proposal, state.proposal_id))
+            .is_some_and(|script| is_vote_script(&script, config, state.proposal_id))
     });
     let root = unified_root(state).ok_or(Error::InvalidState)?;
     if !has_vote
@@ -427,8 +454,6 @@ fn challenge_spend(
     event_proof: &[u8],
     dao_proof: &[u8],
 ) -> Result<(), Error> {
-    let proposal = load_proposal_dep(state.proposal_id)?;
-    ensure_in_voting_window(omitted_spend, &proposal)?;
     let (spend_tx, spend_hash) = verify_proven_transaction(omitted_spend)?;
     let spends_claimed_dao = spend_tx
         .inputs()
@@ -464,8 +489,7 @@ fn challenge_spend(
     pay_bond(challenger)
 }
 
-fn finalize(state: &TallyState) -> Result<(), Error> {
-    let proposal = load_proposal_input(state.proposal_id)?;
+fn finalize(state: &TallyState, proposal: &ProposalData) -> Result<(), Error> {
     let deadline = state
         .candidate_since
         .checked_add(proposal.challenge_period)
@@ -655,11 +679,11 @@ fn unpack_out_point(out_point: &ckb_gen_types::packed::OutPoint) -> OutPoint {
 
 fn is_vote_script(
     script: &ckb_gen_types::packed::Script,
-    proposal: &ProposalData,
+    config: &ProposalConfig,
     proposal_id: Hash,
 ) -> bool {
-    script.code_hash().as_slice() == proposal.vote_code_hash
-        && script.hash_type().as_slice()[0] == proposal.vote_hash_type
+    script.code_hash().as_slice() == config.vote_code_hash
+        && script.hash_type().as_slice()[0] == config.vote_hash_type
         && script.args().raw_data().as_ref() == proposal_id
 }
 
@@ -711,26 +735,59 @@ fn load_state(index: usize, source: Source) -> Result<TallyState, Error> {
     TallyState::decode(&data).map_err(|_| Error::InvalidState)
 }
 
-fn load_proposal_dep(proposal_id: Hash) -> Result<ProposalData, Error> {
+fn load_proposal_dep(proposal_id: Hash) -> Result<(ProposalData, ProposalConfig), Error> {
     load_proposal(proposal_id, Source::CellDep)
 }
 
-fn load_proposal_input(proposal_id: Hash) -> Result<ProposalData, Error> {
+fn load_proposal_input(proposal_id: Hash) -> Result<(ProposalData, ProposalConfig), Error> {
     load_proposal(proposal_id, Source::Input)
 }
 
-fn load_proposal(proposal_id: Hash, source: Source) -> Result<ProposalData, Error> {
+fn load_proposal(
+    proposal_id: Hash,
+    source: Source,
+) -> Result<(ProposalData, ProposalConfig), Error> {
     for (index, type_hash) in QueryIter::new(load_cell_type_hash, source).enumerate() {
         if type_hash == Some(proposal_id) {
+            let type_script = load_cell_type(index, source)
+                .map_err(|_| Error::ProposalInvalid)?
+                .ok_or(Error::ProposalInvalid)?;
             let data = load_cell_data(index, source).map_err(|_| Error::ProposalInvalid)?;
             let proposal = ProposalData::decode(&data).map_err(|_| Error::ProposalInvalid)?;
             if proposal.phase != ProposalPhase::Closed {
                 return Err(Error::ProposalInvalid);
             }
-            return Ok(proposal);
+            let config = load_proposal_config(proposal.proposal_config_type_hash)?;
+            if type_script.code_hash().as_slice() != config.proposal_code_hash
+                || type_script.hash_type().as_slice()[0] != config.proposal_hash_type
+            {
+                return Err(Error::ContractIdentityMismatch);
+            }
+            return Ok((proposal, config));
         }
     }
     Err(Error::ProposalNotFound)
+}
+
+fn load_proposal_config(config_type_hash: Hash) -> Result<ProposalConfig, Error> {
+    for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
+        if type_hash == Some(config_type_hash) {
+            let data = load_cell_data(index, Source::CellDep).map_err(|_| Error::ConfigInvalid)?;
+            return ProposalConfig::decode(&data).map_err(|_| Error::ConfigInvalid);
+        }
+    }
+    Err(Error::ConfigNotFound)
+}
+
+fn ensure_tally_identity(config: &ProposalConfig) -> Result<(), Error> {
+    let script = load_script().map_err(|_| Error::ContractIdentityMismatch)?;
+    if script.code_hash().as_slice() == config.tally_code_hash
+        && script.hash_type().as_slice()[0] == config.tally_hash_type
+    {
+        Ok(())
+    } else {
+        Err(Error::ContractIdentityMismatch)
+    }
 }
 
 fn load_tally_witness() -> Result<(TallyWitness, usize), Error> {

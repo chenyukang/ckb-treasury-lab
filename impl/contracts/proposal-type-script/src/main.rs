@@ -14,7 +14,7 @@ use ckb_std::{
     type_id::check_type_id,
 };
 use treasury_common::{
-    PolicyConfig, ProposalData, ProposalPhase, ResultData, TallyPhase, TallyState, blake2b_256,
+    ProposalConfig, ProposalData, ProposalPhase, ResultData, TallyPhase, TallyState, blake2b_256,
 };
 
 #[repr(i8)]
@@ -60,17 +60,10 @@ fn create() -> Result<(), Error> {
     if proposal.phase != ProposalPhase::Open {
         return Err(Error::InvalidTransition);
     }
-    let config = load_policy_config(proposal.policy_config_type_hash)?;
+    let config = load_proposal_config(proposal.proposal_config_type_hash)?;
     let script = load_script().map_err(|_| Error::ContractIdentityMismatch)?;
-    if proposal.dao_code_hash != config.dao_code_hash
-        || proposal.dao_hash_type != config.dao_hash_type
-        || script.code_hash().as_slice() != config.proposal_code_hash
+    if script.code_hash().as_slice() != config.proposal_code_hash
         || script.hash_type().as_slice()[0] != config.proposal_hash_type
-        || proposal.vote_code_hash != config.vote_code_hash
-        || proposal.vote_hash_type != config.vote_hash_type
-        || proposal.tally_code_hash != config.tally_code_hash
-        || proposal.tally_hash_type != config.tally_hash_type
-        || proposal.policy_type_hash != config.policy_type_hash
     {
         return Err(Error::ContractIdentityMismatch);
     }
@@ -105,11 +98,12 @@ fn finalize() -> Result<(), Error> {
     if proposal.phase != ProposalPhase::Closed {
         return Err(Error::InvalidTransition);
     }
+    let config = load_proposal_config(proposal.proposal_config_type_hash)?;
     let proposal_id = load_script_hash().map_err(|_| Error::InvalidTransition)?;
 
     let mut candidate = None;
     for (index, type_script) in QueryIter::new(load_cell_type, Source::Input).enumerate() {
-        if is_tally_script(&type_script, &proposal) {
+        if is_tally_script(&type_script, &config) {
             let data = load_cell_data(index, Source::Input).map_err(|_| Error::MissingCandidate)?;
             let tally = TallyState::decode(&data).map_err(|_| Error::MissingCandidate)?;
             if tally.phase == TallyPhase::Candidate && tally.proposal_id == proposal_id {
@@ -126,7 +120,7 @@ fn finalize() -> Result<(), Error> {
         load_cell_capacity(0, Source::GroupInput).map_err(|_| Error::ResultMismatch)?;
     let mut result = None;
     for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::Output).enumerate() {
-        if type_hash == Some(proposal.policy_type_hash) {
+        if type_hash == Some(config.policy_type_hash) {
             let data = load_cell_data(index, Source::Output).map_err(|_| Error::MissingResult)?;
             let parsed = ResultData::decode(&data).map_err(|_| Error::MissingResult)?;
             if load_cell_capacity(index, Source::Output).map_err(|_| Error::ResultMismatch)?
@@ -154,11 +148,11 @@ fn finalize() -> Result<(), Error> {
 
 fn is_tally_script(
     script: &Option<ckb_std::ckb_types::packed::Script>,
-    proposal: &ProposalData,
+    config: &ProposalConfig,
 ) -> bool {
     script.as_ref().is_some_and(|script| {
-        script.code_hash().as_slice() == proposal.tally_code_hash
-            && script.hash_type().as_slice()[0] == proposal.tally_hash_type
+        script.code_hash().as_slice() == config.tally_code_hash
+            && script.hash_type().as_slice()[0] == config.tally_hash_type
     })
 }
 
@@ -167,11 +161,11 @@ fn load_proposal(index: usize, source: Source) -> Result<ProposalData, Error> {
     ProposalData::decode(&data).map_err(|_| Error::InvalidProposalData)
 }
 
-fn load_policy_config(config_type_hash: [u8; 32]) -> Result<PolicyConfig, Error> {
+fn load_proposal_config(config_type_hash: [u8; 32]) -> Result<ProposalConfig, Error> {
     for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
         if type_hash == Some(config_type_hash) {
             let data = load_cell_data(index, Source::CellDep).map_err(|_| Error::ConfigInvalid)?;
-            return PolicyConfig::decode(&data).map_err(|_| Error::ConfigInvalid);
+            return ProposalConfig::decode(&data).map_err(|_| Error::ConfigInvalid);
         }
     }
     Err(Error::ConfigNotFound)

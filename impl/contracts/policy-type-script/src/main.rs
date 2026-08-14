@@ -13,7 +13,7 @@ use ckb_std::{
     },
 };
 use treasury_common::{
-    PolicyConfig, ProposalData, ResultData, TallyPhase, TallyState, blake2b_256,
+    ProposalConfig, ProposalData, ResultData, TallyPhase, TallyState, blake2b_256,
 };
 
 #[repr(i8)]
@@ -68,12 +68,12 @@ fn run() -> Result<(), Error> {
 
 fn create_result(
     config_type_hash: [u8; 32],
-    config: PolicyConfig,
+    config: ProposalConfig,
     config_data: &[u8],
 ) -> Result<(), Error> {
     let result_data = load_cell_data(0, Source::GroupOutput).map_err(|_| Error::ResultInvalid)?;
     let result = ResultData::decode(&result_data).map_err(|_| Error::ResultInvalid)?;
-    if result.policy_data_hash != blake2b_256(config_data) {
+    if result.proposal_config_data_hash != blake2b_256(config_data) {
         return Err(Error::ResultMismatch);
     }
 
@@ -92,16 +92,9 @@ fn create_result(
         }
     }
     let (proposal, proposal_script) = proposal.ok_or(Error::ProposalNotFound)?;
-    if proposal.policy_config_type_hash != config_type_hash
-        || proposal.dao_code_hash != config.dao_code_hash
-        || proposal.dao_hash_type != config.dao_hash_type
+    if proposal.proposal_config_type_hash != config_type_hash
         || proposal_script.code_hash().as_slice() != config.proposal_code_hash
         || proposal_script.hash_type().as_slice()[0] != config.proposal_hash_type
-        || proposal.vote_code_hash != config.vote_code_hash
-        || proposal.vote_hash_type != config.vote_hash_type
-        || proposal.tally_code_hash != config.tally_code_hash
-        || proposal.tally_hash_type != config.tally_hash_type
-        || proposal.policy_type_hash != config.policy_type_hash
     {
         return Err(Error::ProposalPolicyMismatch);
     }
@@ -109,8 +102,8 @@ fn create_result(
     let mut candidate = None;
     for (index, type_script) in QueryIter::new(load_cell_type, Source::Input).enumerate() {
         if type_script.as_ref().is_some_and(|script| {
-            script.code_hash().as_slice() == proposal.tally_code_hash
-                && script.hash_type().as_slice()[0] == proposal.tally_hash_type
+            script.code_hash().as_slice() == config.tally_code_hash
+                && script.hash_type().as_slice()[0] == config.tally_hash_type
         }) {
             let data =
                 load_cell_data(index, Source::Input).map_err(|_| Error::CandidateNotFound)?;
@@ -137,7 +130,7 @@ fn create_result(
     Ok(())
 }
 
-fn consume_result(config: PolicyConfig) -> Result<(), Error> {
+fn consume_result(config: ProposalConfig) -> Result<(), Error> {
     let result_data = load_cell_data(0, Source::GroupInput).map_err(|_| Error::ResultInvalid)?;
     let result = ResultData::decode(&result_data).map_err(|_| Error::ResultInvalid)?;
     if !result.passed {
@@ -151,11 +144,11 @@ fn consume_result(config: PolicyConfig) -> Result<(), Error> {
     Ok(())
 }
 
-fn load_config(config_type_hash: [u8; 32]) -> Result<(PolicyConfig, alloc::vec::Vec<u8>), Error> {
+fn load_config(config_type_hash: [u8; 32]) -> Result<(ProposalConfig, alloc::vec::Vec<u8>), Error> {
     for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
         if type_hash == Some(config_type_hash) {
             let data = load_cell_data(index, Source::CellDep).map_err(|_| Error::ConfigInvalid)?;
-            let config = PolicyConfig::decode(&data).map_err(|_| Error::ConfigInvalid)?;
+            let config = ProposalConfig::decode(&data).map_err(|_| Error::ConfigInvalid)?;
             return Ok((config, data));
         }
     }
