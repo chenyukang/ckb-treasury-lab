@@ -9,6 +9,7 @@ members = [
   "contracts/treasury-lock-script",
   "contracts/treasury-common",
   "contracts/vote-type-script",
+  "offchain/live-e2e",
   "offchain/tally-builder",
   "tests"
 ]

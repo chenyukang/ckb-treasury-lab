@@ -2,12 +2,16 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 use ckb_hash::new_blake2b;
 use merkle_cbt::{MerkleProof, merkle_tree::Merge};
 use sparse_merkle_tree::{CompiledMerkleProof, H256, blake2b::Blake2bHasher};
 
 pub const VERSION: u8 = 1;
+pub const TALLY_WITNESS_VERSION: u8 = 3;
+pub const VOTE_STATE_NAMESPACE: u8 = 0;
+pub const DAO_STATE_NAMESPACE: u8 = 1;
+pub const EVENT_STATE_NAMESPACE: u8 = 2;
 pub const PROPOSAL_DATA_LEN: usize = 249;
 pub const TALLY_STATE_LEN: usize = 226;
 pub const RESULT_DATA_LEN: usize = 170;
@@ -23,6 +27,19 @@ pub const TALLY_ACTION_CHALLENGE_SPEND: u8 = 2;
 pub const TALLY_ACTION_FINALIZE: u8 = 3;
 
 pub type Hash = [u8; 32];
+
+pub fn namespaced_state_key(namespace: u8, key: Hash) -> Option<Hash> {
+    if namespace > EVENT_STATE_NAMESPACE {
+        return None;
+    }
+    let mut output = [0u8; 32];
+    let mut hasher = new_blake2b();
+    hasher.update(b"CKB Treasury state key V1");
+    hasher.update(&[namespace]);
+    hasher.update(&key);
+    hasher.finalize(&mut output);
+    Some(output)
+}
 
 fn is_valid_script_hash_type(value: u8) -> bool {
     matches!(value, 0 | 1 | 2 | 4)
@@ -640,27 +657,106 @@ impl ProvenTransaction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvenBlockTransaction {
+    pub tx_index: u32,
+    pub raw_transaction: Vec<u8>,
+}
+
+impl ProvenBlockTransaction {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            tx_index: reader.u32()?,
+            raw_transaction: reader.length_prefixed_bytes()?,
+        })
+    }
+
+    fn encode_into(&self, output: &mut Vec<u8>) -> Result<(), CodecError> {
+        output.extend_from_slice(&self.tx_index.to_le_bytes());
+        encode_length_prefixed(&self.raw_transaction, output)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvenBlock {
+    pub block_number: u64,
+    pub header_dep_index: u16,
+    pub tx_count: u32,
+    pub witnesses_root: Hash,
+    pub transactions: Vec<ProvenBlockTransaction>,
+    pub lemmas: Vec<Hash>,
+}
+
+impl ProvenBlock {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let block_number = reader.u64()?;
+        let header_dep_index = reader.u16()?;
+        let tx_count = reader.u32()?;
+        let witnesses_root = reader.hash()?;
+        let transaction_count = reader.u16()? as usize;
+        let mut transactions = Vec::with_capacity(transaction_count);
+        for _ in 0..transaction_count {
+            transactions.push(ProvenBlockTransaction::decode(reader)?);
+        }
+        let lemma_count = reader.u16()? as usize;
+        let mut lemmas = Vec::with_capacity(lemma_count);
+        for _ in 0..lemma_count {
+            lemmas.push(reader.hash()?);
+        }
+        Ok(Self {
+            block_number,
+            header_dep_index,
+            tx_count,
+            witnesses_root,
+            transactions,
+            lemmas,
+        })
+    }
+
+    fn encode_into(&self, output: &mut Vec<u8>) -> Result<(), CodecError> {
+        let transaction_count: u16 = self
+            .transactions
+            .len()
+            .try_into()
+            .map_err(|_| CodecError::Overflow)?;
+        let lemma_count: u16 = self
+            .lemmas
+            .len()
+            .try_into()
+            .map_err(|_| CodecError::Overflow)?;
+        output.extend_from_slice(&self.block_number.to_le_bytes());
+        output.extend_from_slice(&self.header_dep_index.to_le_bytes());
+        output.extend_from_slice(&self.tx_count.to_le_bytes());
+        output.extend_from_slice(&self.witnesses_root);
+        output.extend_from_slice(&transaction_count.to_le_bytes());
+        for transaction in &self.transactions {
+            transaction.encode_into(output)?;
+        }
+        output.extend_from_slice(&lemma_count.to_le_bytes());
+        for lemma in &self.lemmas {
+            output.extend_from_slice(lemma);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchWitness {
     pub end_block: u64,
     pub end_tx_index: u32,
-    pub events: Vec<ProvenTransaction>,
+    pub blocks: Vec<ProvenBlock>,
     pub previous_vote_records: Vec<VoteRecord>,
-    pub vote_transitions: Vec<LeafTransition>,
-    pub dao_transitions: Vec<LeafTransition>,
-    pub event_transitions: Vec<LeafTransition>,
-    pub vote_proof: Vec<u8>,
-    pub dao_proof: Vec<u8>,
-    pub event_proof: Vec<u8>,
+    pub state_transitions: Vec<LeafTransition>,
+    pub state_proof: Vec<u8>,
 }
 
 impl BatchWitness {
     fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         let end_block = reader.u64()?;
         let end_tx_index = reader.u32()?;
-        let event_count = reader.u16()? as usize;
-        let mut events = Vec::with_capacity(event_count);
-        for _ in 0..event_count {
-            events.push(ProvenTransaction::decode(reader)?);
+        let block_count = reader.u16()? as usize;
+        let mut blocks = Vec::with_capacity(block_count);
+        for _ in 0..block_count {
+            blocks.push(ProvenBlock::decode(reader)?);
         }
 
         let record_count = reader.u16()? as usize;
@@ -671,20 +767,16 @@ impl BatchWitness {
         Ok(Self {
             end_block,
             end_tx_index,
-            events,
+            blocks,
             previous_vote_records,
-            vote_transitions: decode_transitions(reader)?,
-            dao_transitions: decode_transitions(reader)?,
-            event_transitions: decode_transitions(reader)?,
-            vote_proof: reader.length_prefixed_bytes()?,
-            dao_proof: reader.length_prefixed_bytes()?,
-            event_proof: reader.length_prefixed_bytes()?,
+            state_transitions: decode_transitions(reader)?,
+            state_proof: reader.length_prefixed_bytes()?,
         })
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        let event_count: u16 = self
-            .events
+        let block_count: u16 = self
+            .blocks
             .len()
             .try_into()
             .map_err(|_| CodecError::Overflow)?;
@@ -694,25 +786,27 @@ impl BatchWitness {
             .try_into()
             .map_err(|_| CodecError::Overflow)?;
         let mut output = Vec::new();
-        output.push(VERSION);
+        output.push(TALLY_WITNESS_VERSION);
         output.push(TALLY_ACTION_ADVANCE);
         output.extend_from_slice(&self.end_block.to_le_bytes());
         output.extend_from_slice(&self.end_tx_index.to_le_bytes());
-        output.extend_from_slice(&event_count.to_le_bytes());
-        for event in &self.events {
-            event.encode_into(&mut output)?;
+        output.extend_from_slice(&block_count.to_le_bytes());
+        for block in &self.blocks {
+            block.encode_into(&mut output)?;
         }
         output.extend_from_slice(&record_count.to_le_bytes());
         for record in &self.previous_vote_records {
             encode_length_prefixed(&record.encode()?, &mut output)?;
         }
-        encode_transitions(&self.vote_transitions, &mut output)?;
-        encode_transitions(&self.dao_transitions, &mut output)?;
-        encode_transitions(&self.event_transitions, &mut output)?;
-        encode_length_prefixed(&self.vote_proof, &mut output)?;
-        encode_length_prefixed(&self.dao_proof, &mut output)?;
-        encode_length_prefixed(&self.event_proof, &mut output)?;
+        encode_transitions(&self.state_transitions, &mut output)?;
+        encode_length_prefixed(&self.state_proof, &mut output)?;
         Ok(output)
+    }
+
+    pub fn event_count(&self) -> Option<usize> {
+        self.blocks.iter().try_fold(0usize, |count, block| {
+            count.checked_add(block.transactions.len())
+        })
     }
 }
 
@@ -738,7 +832,7 @@ pub enum TallyWitness {
 impl TallyWitness {
     pub fn decode(data: &[u8]) -> Result<Self, CodecError> {
         let mut reader = Reader::new(data);
-        reader.version()?;
+        reader.expected_version(TALLY_WITNESS_VERSION)?;
         let witness = match reader.u8()? {
             TALLY_ACTION_ADVANCE => Self::Advance(BatchWitness::decode(&mut reader)?),
             TALLY_ACTION_CHALLENGE_VOTE => Self::ChallengeVote {
@@ -766,7 +860,7 @@ impl TallyWitness {
             return batch.encode();
         }
         let mut output = Vec::new();
-        output.push(VERSION);
+        output.push(TALLY_WITNESS_VERSION);
         match self {
             Self::Advance(_) => unreachable!(),
             Self::ChallengeVote {
@@ -844,7 +938,7 @@ pub fn verify_smt_transition(
     proof: &[u8],
     leaves: &[LeafTransition],
 ) -> bool {
-    if leaves.is_empty() || has_duplicate_keys(leaves) {
+    if leaves.is_empty() || !keys_strictly_ascending(leaves) {
         return false;
     }
     let compiled = CompiledMerkleProof(proof.to_vec());
@@ -866,12 +960,8 @@ pub fn verify_smt_transition(
             == Some(true)
 }
 
-fn has_duplicate_keys(leaves: &[LeafTransition]) -> bool {
-    leaves.iter().enumerate().any(|(index, leaf)| {
-        leaves[index + 1..]
-            .iter()
-            .any(|other| leaf.key == other.key)
-    })
+fn keys_strictly_ascending(leaves: &[LeafTransition]) -> bool {
+    leaves.windows(2).all(|pair| pair[0].key < pair[1].key)
 }
 
 pub struct MergeHash;
@@ -902,6 +992,61 @@ pub fn verify_cbmt_inclusion(
     };
     MerkleProof::<Hash, MergeHash>::new(alloc::vec![tree_index], lemmas.to_vec())
         .verify(&expected_root, &[leaf])
+}
+
+pub fn cbmt_multi_root(
+    tx_count: u32,
+    indexed_leaves: &[(u32, Hash)],
+    lemmas: &[Hash],
+) -> Option<Hash> {
+    if tx_count == 0
+        || indexed_leaves.is_empty()
+        || indexed_leaves.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        || indexed_leaves.iter().any(|(index, _)| *index >= tx_count)
+    {
+        return None;
+    }
+    let base = tx_count.checked_sub(1)?;
+    let mut queue = indexed_leaves
+        .iter()
+        .rev()
+        .map(|(index, leaf)| {
+            base.checked_add(*index)
+                .map(|tree_index| (tree_index, *leaf))
+        })
+        .collect::<Option<VecDeque<_>>>()?;
+    let mut lemmas = lemmas.iter();
+
+    while let Some((index, node)) = queue.pop_front() {
+        if index == 0 {
+            return if queue.is_empty() && lemmas.next().is_none() {
+                Some(node)
+            } else {
+                None
+            };
+        }
+        let sibling_index = if index & 1 == 1 {
+            index.checked_add(1)?
+        } else {
+            index - 1
+        };
+        let sibling = if queue
+            .front()
+            .is_some_and(|(queued_index, _)| *queued_index == sibling_index)
+        {
+            queue.pop_front().map(|(_, hash)| hash)?
+        } else {
+            *lemmas.next()?
+        };
+        let parent = (index - 1) >> 1;
+        let parent_hash = if index & 1 == 1 {
+            hash_pair(&node, &sibling)
+        } else {
+            hash_pair(&sibling, &node)
+        };
+        queue.push_back((parent, parent_hash));
+    }
+    None
 }
 
 pub fn transactions_root(raw_transactions_root: Hash, witnesses_root: Hash) -> Hash {
@@ -946,7 +1091,11 @@ impl<'a> Reader<'a> {
     }
 
     fn version(&mut self) -> Result<(), CodecError> {
-        if self.u8()? == VERSION {
+        self.expected_version(VERSION)
+    }
+
+    fn expected_version(&mut self, version: u8) -> Result<(), CodecError> {
+        if self.u8()? == version {
             Ok(())
         } else {
             Err(CodecError::InvalidVersion)
@@ -1220,5 +1369,152 @@ mod tests {
             transactions_root(raw_root, [9; 32]),
             hash_pair(&raw_root, &[9; 32])
         );
+    }
+
+    #[test]
+    fn verifies_cbmt_multiproof_with_index_binding() {
+        type Tree = merkle_cbt::CBMT<Hash, MergeHash>;
+        let leaves = alloc::vec![[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
+        let root = Tree::build_merkle_root(&leaves);
+        let proof = Tree::build_merkle_proof(&leaves, &[1, 3]).unwrap();
+        let indexed = alloc::vec![(1, leaves[1]), (3, leaves[3])];
+        assert_eq!(
+            cbmt_multi_root(leaves.len() as u32, &indexed, proof.lemmas()),
+            Some(root)
+        );
+
+        let mut modified = indexed.clone();
+        modified[0].1[0] ^= 1;
+        assert_ne!(
+            cbmt_multi_root(leaves.len() as u32, &modified, proof.lemmas()),
+            Some(root)
+        );
+        assert_eq!(
+            cbmt_multi_root(
+                leaves.len() as u32,
+                &[(3, leaves[3]), (1, leaves[1])],
+                proof.lemmas()
+            ),
+            None
+        );
+        assert_eq!(
+            cbmt_multi_root(
+                leaves.len() as u32,
+                &[(1, leaves[1]), (1, leaves[1])],
+                proof.lemmas()
+            ),
+            None
+        );
+        assert_eq!(
+            cbmt_multi_root(leaves.len() as u32, &indexed, &proof.lemmas()[1..]),
+            None
+        );
+    }
+
+    #[test]
+    fn cbmt_multiproof_matches_ckb_tree_shapes() {
+        type Tree = merkle_cbt::CBMT<Hash, MergeHash>;
+        for leaf_count in 1usize..=32 {
+            let leaves = (0..leaf_count)
+                .map(|index| blake2b_256(&(index as u64).to_le_bytes()))
+                .collect::<Vec<_>>();
+            let mut selections = alloc::vec![
+                alloc::vec![0u32],
+                alloc::vec![(leaf_count - 1) as u32],
+                (0..leaf_count as u32).step_by(2).collect(),
+                (0..leaf_count as u32).collect(),
+            ];
+            selections.dedup();
+            for indices in selections {
+                let proof = Tree::build_merkle_proof(&leaves, &indices).unwrap();
+                let indexed = indices
+                    .iter()
+                    .map(|index| (*index, leaves[*index as usize]))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    cbmt_multi_root(leaf_count as u32, &indexed, proof.lemmas()),
+                    Some(Tree::build_merkle_root(&leaves)),
+                    "leaf_count={leaf_count} indices={indices:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tally_witness_uses_explicit_v3_encoding() {
+        let encoded = TallyWitness::Finalize.encode().unwrap();
+        assert_eq!(encoded[0], TALLY_WITNESS_VERSION);
+        assert_eq!(TallyWitness::decode(&encoded), Ok(TallyWitness::Finalize));
+
+        let mut legacy = encoded;
+        legacy[0] = VERSION;
+        assert_eq!(
+            TallyWitness::decode(&legacy),
+            Err(CodecError::InvalidVersion)
+        );
+    }
+
+    #[test]
+    fn state_key_namespaces_are_disjoint() {
+        let key = [0xff; 32];
+        let vote = namespaced_state_key(VOTE_STATE_NAMESPACE, key).unwrap();
+        let dao = namespaced_state_key(DAO_STATE_NAMESPACE, key).unwrap();
+        let event = namespaced_state_key(EVENT_STATE_NAMESPACE, key).unwrap();
+        assert_ne!(vote, dao);
+        assert_ne!(vote, event);
+        assert_ne!(dao, event);
+        assert_eq!(
+            vote,
+            namespaced_state_key(VOTE_STATE_NAMESPACE, key).unwrap()
+        );
+        assert!(namespaced_state_key(3, key).is_none());
+    }
+
+    #[test]
+    fn rejects_noncanonical_smt_transition_keys() {
+        type Smt = SparseMerkleTree<Blake2bHasher, Word, DefaultStore<Word>>;
+        let first_key: H256 = [1u8; 32].into();
+        let second_key: H256 = [2u8; 32].into();
+        let old_value = [3u8; 32];
+        let new_value = [4u8; 32];
+        let mut tree = Smt::default();
+        tree.update(first_key, Word(old_value)).unwrap();
+        tree.update(second_key, Word(old_value)).unwrap();
+        let old_root: Hash = (*tree.root()).into();
+        let proof = tree
+            .merkle_proof(alloc::vec![first_key, second_key])
+            .unwrap()
+            .compile(alloc::vec![first_key, second_key])
+            .unwrap();
+        tree.update(first_key, Word(new_value)).unwrap();
+        tree.update(second_key, Word(new_value)).unwrap();
+        let new_root: Hash = (*tree.root()).into();
+        let sorted = alloc::vec![
+            LeafTransition {
+                key: first_key.into(),
+                old_value,
+                new_value,
+            },
+            LeafTransition {
+                key: second_key.into(),
+                old_value,
+                new_value,
+            },
+        ];
+        assert!(verify_smt_transition(old_root, new_root, &proof.0, &sorted));
+
+        let mut unsorted = sorted.clone();
+        unsorted.reverse();
+        assert!(!verify_smt_transition(
+            old_root, new_root, &proof.0, &unsorted
+        ));
+
+        let duplicated = alloc::vec![sorted[0], sorted[0]];
+        assert!(!verify_smt_transition(
+            old_root,
+            new_root,
+            &proof.0,
+            &duplicated
+        ));
     }
 }

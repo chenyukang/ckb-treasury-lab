@@ -1,12 +1,11 @@
 # Treasury Voting Benchmarks
 
-## Optimistic batch settlement V1
+## Optimistic batch settlement
 
 The implemented benchmark is the ignored test
 `contract_tests::tests::benchmark_tally_batch_cycles`. It creates independent
-voters, one DAO outpoint per voter, CBMT inclusion proofs for every VoteTx, and
-old/new proofs for all three SMTs. The builder-produced transaction then runs in
-CKB-VM through `ckb-testtool`.
+voters and one DAO outpoint per voter. The builder-produced transaction then runs
+in CKB-VM through `ckb-testtool`.
 
 Run it with:
 
@@ -17,24 +16,67 @@ cargo test -p contract-tests benchmark_tally_batch_cycles -- --ignored --nocaptu
 ```
 
 Measured on Apple M2 Pro (`arm64`) with Rust 1.95.0 and the contract build's
-release profile plus debug assertions:
+release profile plus debug assertions.
+
+### Reproduced V1 baseline
 
 | Independent votes | CKB-VM cycles | Cycles per vote | Batch witness | Settlement tx |
 |---:|---:|---:|---:|---:|
-| 1 | 3,253,229 | 3,253,229 | 670 B | 1,390 B |
-| 10 | 32,328,142 | 3,232,814 | 7,505 B | 8,225 B |
-| 50 | 163,068,826 | 3,261,376 | 41,111 B | 41,831 B |
-| 100 | 326,974,360 | 3,269,743 | 85,387 B | 86,107 B |
+| 1 | 3,250,782 | 3,250,782 | 670 B | 1,390 B |
+| 10 | 32,333,827 | 3,233,382 | 7,509 B | 8,229 B |
+| 50 | 162,938,523 | 3,258,770 | 41,093 B | 41,813 B |
+| 100 | 327,064,874 | 3,270,648 | 85,387 B | 86,107 B |
 
-The cost is approximately linear at 3.25M to 3.27M cycles per independent vote.
-At a 50M to 60M operational target, a batch should contain roughly 15 to 18
-independent votes. A 100-vote batch uses about 9.3% of CKB's default 3.5B block
-cycle limit and about 14.4% of the default 597,000-byte block limit. Cycles reach
-the chosen operational target before transaction bytes do.
+### Optimized V3
 
-These figures are preliminary. Revote-heavy, multi-DAO-deposit, DAO-spend, and
-adversarial proof shapes still need separate measurements before production
-parameters are frozen.
+V3 preserves the same header commitment, RawTransaction hashing, reducer, old/new
+state-root verification, and final omission challenges. It changes only the
+proof representation and deterministic implementation:
+
+- transition keys must be strictly increasing, replacing quadratic duplicate
+  detection with one linear pass;
+- all relevant transactions from one block share one CBMT multiproof and one
+  copy of block metadata;
+- vote, DAO-outpoint, and processed-event leaves use BLAKE2b domain-separated
+  namespaces in one SMT, verified once against both the old and new roots;
+- the tally witness has an explicit V3 version, so older encodings are rejected.
+
+| Independent votes | CKB-VM cycles | Cycles per vote | Batch witness | Settlement tx |
+|---:|---:|---:|---:|---:|
+| 1 | 3,292,919 | 3,292,919 | 662 B | 1,382 B |
+| 10 | 31,740,341 | 3,174,034 | 5,977 B | 6,697 B |
+| 20 | 63,291,558 | 3,164,577 | 11,885 B | 12,605 B |
+| 21 | 66,409,707 | 3,162,367 | 12,468 B | 13,188 B |
+| 22 | 69,548,994 | 3,161,317 | 13,065 B | 13,785 B |
+| 23 | 72,695,867 | 3,160,689 | 13,654 B | 14,374 B |
+| 50 | 157,696,837 | 3,153,936 | 29,605 B | 30,325 B |
+| 100 | 314,427,610 | 3,144,276 | 59,099 B | 59,819 B |
+| 200 | 628,181,614 | 3,140,908 | 118,189 B | 118,909 B |
+| 500 | 1,566,878,583 | 3,133,757 | 295,281 B | 296,001 B |
+
+At 100 independent votes, V3 reduces cycles by 3.9% and witness bytes by 30.8%
+relative to the reproduced V1 baseline. The verification cost remains linear at
+about 3.13M to 3.17M cycles per independent vote.
+
+The default 70M `tx_pool.max_tx_verify_cycles` is not a consensus or current
+transaction-admission ceiling. It is primarily the local threshold that marks a
+remote transaction as large-cycle for verification-worker scheduling. Therefore,
+22 votes at 69.55M and 23 votes at 72.70M fall on different sides of that
+scheduling threshold, but both remain valid transaction-pool and relay candidates.
+
+Consensus block verification gives each transaction up to the consensus
+`max_block_cycles` and also requires the sum for the block to stay within that
+same limit. A 100-vote batch uses about 9.0% of CKB's default 3.5B block cycle
+limit and 10.0% of the default 597,000-byte block limit, so it fits both measured
+consensus resources. Raising `tx_pool.max_tx_verify_cycles` is not required to
+accept it; doing so mainly lets more workers handle it as a small-cycle
+transaction and reduces the intended isolation of expensive remote transactions.
+
+The implemented 100-event hard cap is therefore a reasonable current builder
+target for the independent-vote shape, rather than a 20-event ceiling. These
+figures are still preliminary: revote-heavy, multi-DAO-deposit, DAO-spend, sparse
+cross-block, and adversarial proof shapes need separate measurements before the
+production cap is frozen.
 
 ## Legacy node-scan proposal benchmark
 
@@ -138,4 +180,3 @@ Results are as follows:
 
 It costs 2.1 seconds in total. Normalized to 1 day, that is 22.7 seconds (158.8 seconds for 7 days).
 Although this scenario is at maximum throughput, the processing time is significant. We need a plan to reduce the total workload.
-

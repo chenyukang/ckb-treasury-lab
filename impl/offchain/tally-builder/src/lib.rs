@@ -6,8 +6,9 @@ use sparse_merkle_tree::{
     H256, SparseMerkleTree, blake2b::Blake2bHasher, default_store::DefaultStore,
 };
 use treasury_common::{
-    BatchWitness, EVENT_PRESENT, Hash, LeafTransition, MergeHash, OutPoint, ProposalData,
-    ProvenTransaction, TallyPhase, TallyState, VoteData, VoteRecord,
+    BatchWitness, DAO_STATE_NAMESPACE, EVENT_PRESENT, EVENT_STATE_NAMESPACE, Hash, LeafTransition,
+    MergeHash, OutPoint, ProposalData, ProvenBlock, ProvenBlockTransaction, ProvenTransaction,
+    TallyPhase, TallyState, VOTE_STATE_NAMESPACE, VoteData, VoteRecord, namespaced_state_key,
 };
 
 mod rpc;
@@ -63,7 +64,7 @@ pub struct ChainBlock {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScannedBatch {
-    pub events: Vec<ProvenTransaction>,
+    pub blocks: Vec<ProvenBlock>,
     pub header_deps: Vec<Hash>,
     pub end_block: u64,
     pub end_tx_index: u32,
@@ -72,9 +73,7 @@ pub struct ScannedBatch {
 
 pub struct TallyBuilder {
     state: TallyState,
-    votes: Smt,
-    dao: Smt,
-    events: Smt,
+    committed_state: Smt,
     records: BTreeMap<Hash, VoteRecord>,
 }
 
@@ -103,9 +102,7 @@ impl TallyBuilder {
                 processed_events: 0,
                 candidate_since: 0,
             },
-            votes: Smt::default(),
-            dao: Smt::default(),
-            events: Smt::default(),
+            committed_state: Smt::default(),
             records: BTreeMap::new(),
         }
     }
@@ -120,35 +117,39 @@ impl TallyBuilder {
         &self,
         proposal: &ProposalData,
         block: &BlockTransactions,
-    ) -> Result<Vec<ProvenTransaction>, BuilderError> {
+    ) -> Result<Vec<ProvenBlock>, BuilderError> {
         let mut view = self.clone_builder();
-        let mut events = Vec::new();
+        let mut event_indices = Vec::new();
         for (index, raw_bytes) in block.raw_transactions.iter().enumerate() {
             let raw =
                 RawTransaction::from_slice(raw_bytes).map_err(|_| BuilderError::InvalidEvent)?;
             if !view.is_relevant(proposal, &raw)? {
                 continue;
             }
-            let proven = prove_transaction(
+            let tx_index = index.try_into().map_err(|_| BuilderError::InvalidEvent)?;
+            let mut vote_keys = BTreeSet::new();
+            let mut state_keys = BTreeSet::new();
+            view.apply_event(
+                proposal,
+                block.block_number,
+                tx_index,
+                raw_bytes,
+                &mut vote_keys,
+                &mut state_keys,
+            )?;
+            event_indices.push(tx_index);
+        }
+        if event_indices.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![prove_block_transactions(
                 block.block_number,
                 block.header_dep_index,
                 &block.raw_transactions,
                 block.witnesses_root,
-                index as u32,
-            )?;
-            let mut vote_keys = BTreeSet::new();
-            let mut dao_keys = BTreeSet::new();
-            let mut event_keys = BTreeSet::new();
-            view.apply_event(
-                proposal,
-                &proven,
-                &mut vote_keys,
-                &mut dao_keys,
-                &mut event_keys,
-            )?;
-            events.push(proven);
+                &event_indices,
+            )?])
         }
-        Ok(events)
     }
 
     /// Scans consecutive canonical blocks while carrying the temporary reducer
@@ -178,7 +179,8 @@ impl TallyBuilder {
         }
 
         let mut view = self.clone_builder();
-        let mut events = Vec::new();
+        let mut proven_blocks = Vec::new();
+        let mut event_count = 0usize;
         let mut header_deps = Vec::new();
         for (block_offset, block) in blocks.iter().enumerate() {
             let start_index = if block_offset == 0 {
@@ -189,40 +191,58 @@ impl TallyBuilder {
             if start_index > block.raw_transactions.len() {
                 return Err(BuilderError::CursorInvalid);
             }
+            let mut event_indices = Vec::new();
+            let mut block_header_dep_index = None;
             for (index, raw_bytes) in block.raw_transactions.iter().enumerate().skip(start_index) {
                 let raw = RawTransaction::from_slice(raw_bytes)
                     .map_err(|_| BuilderError::InvalidEvent)?;
                 if !view.is_relevant(proposal, &raw)? {
                     continue;
                 }
-                if events.len() == proposal.max_events_per_batch as usize {
+                if event_count == proposal.max_events_per_batch as usize {
+                    if !event_indices.is_empty() {
+                        proven_blocks.push(prove_block_transactions(
+                            block.block_number,
+                            block_header_dep_index.ok_or(BuilderError::InvalidState)?,
+                            &block.raw_transactions,
+                            block.witnesses_root,
+                            &event_indices,
+                        )?);
+                    }
                     return Ok(ScannedBatch {
-                        events,
+                        blocks: proven_blocks,
                         header_deps,
                         end_block: block.block_number,
                         end_tx_index: index.try_into().map_err(|_| BuilderError::CursorInvalid)?,
                         candidate_since: 0,
                     });
                 }
-                let header_dep_index = header_dep_index(&mut header_deps, block.block_hash)?;
-                let proven = prove_transaction(
-                    block.block_number,
-                    header_dep_index,
-                    &block.raw_transactions,
-                    block.witnesses_root,
-                    index.try_into().map_err(|_| BuilderError::InvalidEvent)?,
-                )?;
+                if block_header_dep_index.is_none() {
+                    block_header_dep_index =
+                        Some(header_dep_index(&mut header_deps, block.block_hash)?);
+                }
+                let tx_index = index.try_into().map_err(|_| BuilderError::InvalidEvent)?;
                 let mut vote_keys = BTreeSet::new();
-                let mut dao_keys = BTreeSet::new();
-                let mut event_keys = BTreeSet::new();
+                let mut state_keys = BTreeSet::new();
                 view.apply_event(
                     proposal,
-                    &proven,
+                    block.block_number,
+                    tx_index,
+                    raw_bytes,
                     &mut vote_keys,
-                    &mut dao_keys,
-                    &mut event_keys,
+                    &mut state_keys,
                 )?;
-                events.push(proven);
+                event_indices.push(tx_index);
+                event_count += 1;
+            }
+            if !event_indices.is_empty() {
+                proven_blocks.push(prove_block_transactions(
+                    block.block_number,
+                    block_header_dep_index.ok_or(BuilderError::InvalidState)?,
+                    &block.raw_transactions,
+                    block.witnesses_root,
+                    &event_indices,
+                )?);
             }
         }
 
@@ -242,7 +262,7 @@ impl TallyBuilder {
             0
         };
         Ok(ScannedBatch {
-            events,
+            blocks: proven_blocks,
             header_deps,
             end_block,
             end_tx_index: 0,
@@ -273,13 +293,17 @@ impl TallyBuilder {
     pub fn build_batch(
         &mut self,
         proposal: &ProposalData,
-        proven_events: Vec<ProvenTransaction>,
+        proven_blocks: Vec<ProvenBlock>,
         end_block: u64,
         end_tx_index: u32,
         candidate_since: u64,
     ) -> Result<(TallyState, BatchWitness), BuilderError> {
+        let event_count = proven_blocks.iter().try_fold(0usize, |count, block| {
+            count.checked_add(block.transactions.len())
+        });
+        let event_count = event_count.ok_or(BuilderError::BatchLimit)?;
         if self.state.phase != TallyPhase::Active
-            || proven_events.len() > proposal.max_events_per_batch as usize
+            || event_count > proposal.max_events_per_batch as usize
         {
             return Err(BuilderError::BatchLimit);
         }
@@ -298,79 +322,73 @@ impl TallyBuilder {
 
         let mut next = self.clone_builder();
         let mut vote_keys = BTreeSet::new();
-        let mut dao_keys = BTreeSet::new();
-        let mut event_keys = BTreeSet::new();
+        let mut state_keys = BTreeSet::new();
         let mut previous_cursor = None;
-        for event in &proven_events {
-            let cursor = (event.block_number, event.tx_index);
-            if cursor < input_cursor
-                || cursor >= output_cursor
-                || event.block_number < proposal.start_block
-                || event.block_number > proposal.end_block
-                || previous_cursor.is_some_and(|previous| cursor <= previous)
+        let mut previous_block = None;
+        for block in &proven_blocks {
+            if block.transactions.is_empty()
+                || previous_block.is_some_and(|number| number >= block.block_number)
             {
                 return Err(BuilderError::InvalidEvent);
             }
-            previous_cursor = Some(cursor);
-            next.apply_event(
-                proposal,
-                event,
-                &mut vote_keys,
-                &mut dao_keys,
-                &mut event_keys,
-            )?;
+            previous_block = Some(block.block_number);
+            let mut previous_tx_index = None;
+            for transaction in &block.transactions {
+                let cursor = (block.block_number, transaction.tx_index);
+                if cursor < input_cursor
+                    || cursor >= output_cursor
+                    || block.block_number < proposal.start_block
+                    || block.block_number > proposal.end_block
+                    || transaction.tx_index >= block.tx_count
+                    || previous_tx_index.is_some_and(|index| index >= transaction.tx_index)
+                    || previous_cursor.is_some_and(|previous| cursor <= previous)
+                {
+                    return Err(BuilderError::InvalidEvent);
+                }
+                previous_tx_index = Some(transaction.tx_index);
+                previous_cursor = Some(cursor);
+                next.apply_event(
+                    proposal,
+                    block.block_number,
+                    transaction.tx_index,
+                    &transaction.raw_transaction,
+                    &mut vote_keys,
+                    &mut state_keys,
+                )?;
+            }
         }
-        if vote_keys.len() > proposal.max_state_keys_per_batch as usize
-            || dao_keys.len() > proposal.max_state_keys_per_batch as usize
-            || event_keys.len() > proposal.max_state_keys_per_batch as usize
-        {
+        if state_keys.len() > proposal.max_state_keys_per_batch as usize {
             return Err(BuilderError::BatchLimit);
         }
 
-        let (
-            vote_transitions,
-            dao_transitions,
-            event_transitions,
-            vote_proof,
-            dao_proof,
-            event_proof,
-            previous_vote_records,
-        ) = if proven_events.is_empty() {
-            (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )
+        let (state_transitions, state_proof, previous_vote_records) = if event_count == 0 {
+            (Vec::new(), Vec::new(), Vec::new())
         } else {
-            let vote_transitions = transitions(&self.votes, &next.votes, &vote_keys)?;
-            let dao_transitions = transitions(&self.dao, &next.dao, &dao_keys)?;
-            let event_transitions = transitions(&self.events, &next.events, &event_keys)?;
-            let vote_proof = compiled_proof(&self.votes, &vote_keys)?;
-            let dao_proof = compiled_proof(&self.dao, &dao_keys)?;
-            let event_proof = compiled_proof(&self.events, &event_keys)?;
-            let previous_vote_records = vote_transitions
+            let state_transitions =
+                transitions(&self.committed_state, &next.committed_state, &state_keys)?;
+            let state_proof = compiled_proof(&self.committed_state, &state_keys)?;
+            let previous_vote_records = vote_keys
                 .iter()
-                .filter(|transition| transition.old_value != ZERO)
-                .map(|transition| {
-                    self.records
-                        .get(&transition.key)
-                        .cloned()
-                        .ok_or(BuilderError::MissingStateKey)
+                .map(|voter| {
+                    if value(
+                        &self.committed_state,
+                        state_key(VOTE_STATE_NAMESPACE, *voter),
+                    )? == ZERO
+                    {
+                        Ok(None)
+                    } else {
+                        self.records
+                            .get(voter)
+                            .cloned()
+                            .map(Some)
+                            .ok_or(BuilderError::MissingStateKey)
+                    }
                 })
-                .collect::<Result<Vec<_>, _>>()?;
-            (
-                vote_transitions,
-                dao_transitions,
-                event_transitions,
-                vote_proof,
-                dao_proof,
-                event_proof,
-                previous_vote_records,
-            )
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            (state_transitions, state_proof, previous_vote_records)
         };
 
         next.state.phase = if output_cursor == final_cursor {
@@ -391,11 +409,12 @@ impl TallyBuilder {
         next.state.processed_events = next
             .state
             .processed_events
-            .checked_add(proven_events.len() as u64)
+            .checked_add(event_count as u64)
             .ok_or(BuilderError::TallyOverflow)?;
-        next.state.votes_root = root(&next.votes);
-        next.state.dao_root = root(&next.dao);
-        next.state.events_root = root(&next.events);
+        let committed_root = root(&next.committed_state);
+        next.state.votes_root = committed_root;
+        next.state.dao_root = committed_root;
+        next.state.events_root = committed_root;
         next.state.candidate_since = if next.state.phase == TallyPhase::Candidate {
             if candidate_since < proposal.end_block {
                 return Err(BuilderError::CursorInvalid);
@@ -408,14 +427,10 @@ impl TallyBuilder {
         let witness = BatchWitness {
             end_block,
             end_tx_index,
-            events: proven_events,
+            blocks: proven_blocks,
             previous_vote_records,
-            vote_transitions,
-            dao_transitions,
-            event_transitions,
-            vote_proof,
-            dao_proof,
-            event_proof,
+            state_transitions,
+            state_proof,
         };
         if witness.encode().map_err(|_| BuilderError::Encoding)?.len()
             > proposal.max_batch_witness_bytes as usize
@@ -435,14 +450,15 @@ impl TallyBuilder {
         let raw = RawTransaction::from_slice(&omitted.raw_transaction)
             .map_err(|_| BuilderError::InvalidEvent)?;
         let tx_hash: Hash = raw.calc_tx_hash().as_slice().try_into().unwrap();
-        if value(&self.events, tx_hash)? != ZERO {
+        let event_key = state_key(EVENT_STATE_NAMESPACE, tx_hash);
+        if value(&self.committed_state, event_key)? != ZERO {
             return Err(BuilderError::InvalidEvent);
         }
-        let keys = BTreeSet::from([tx_hash]);
+        let keys = BTreeSet::from([event_key]);
         Ok(treasury_common::TallyWitness::ChallengeVote {
             challenger_lock_hash,
             omitted,
-            event_proof: compiled_proof(&self.events, &keys)?,
+            event_proof: compiled_proof(&self.committed_state, &keys)?,
         })
     }
 
@@ -462,11 +478,12 @@ impl TallyBuilder {
             return Err(BuilderError::InvalidEvent);
         }
         let spend_hash: Hash = raw.calc_tx_hash().as_slice().try_into().unwrap();
-        if value(&self.events, spend_hash)? != ZERO {
+        let event_key = state_key(EVENT_STATE_NAMESPACE, spend_hash);
+        if value(&self.committed_state, event_key)? != ZERO {
             return Err(BuilderError::InvalidEvent);
         }
-        let dao_key = dao_out_point.key();
-        let voter_lock_hash = value(&self.dao, dao_key)?;
+        let dao_key = state_key(DAO_STATE_NAMESPACE, dao_out_point.key());
+        let voter_lock_hash = value(&self.committed_state, dao_key)?;
         if voter_lock_hash == ZERO {
             return Err(BuilderError::InvalidState);
         }
@@ -475,27 +492,29 @@ impl TallyBuilder {
             omitted_spend,
             dao_out_point,
             voter_lock_hash,
-            event_proof: compiled_proof(&self.events, &BTreeSet::from([spend_hash]))?,
-            dao_proof: compiled_proof(&self.dao, &BTreeSet::from([dao_key]))?,
+            event_proof: compiled_proof(&self.committed_state, &BTreeSet::from([event_key]))?,
+            dao_proof: compiled_proof(&self.committed_state, &BTreeSet::from([dao_key]))?,
         })
     }
 
     fn apply_event(
         &mut self,
         proposal: &ProposalData,
-        event: &ProvenTransaction,
+        block_number: u64,
+        tx_index: u32,
+        raw_transaction: &[u8],
         vote_keys: &mut BTreeSet<Hash>,
-        dao_keys: &mut BTreeSet<Hash>,
-        event_keys: &mut BTreeSet<Hash>,
+        state_keys: &mut BTreeSet<Hash>,
     ) -> Result<(), BuilderError> {
-        let raw = RawTransaction::from_slice(&event.raw_transaction)
-            .map_err(|_| BuilderError::InvalidEvent)?;
+        let raw =
+            RawTransaction::from_slice(raw_transaction).map_err(|_| BuilderError::InvalidEvent)?;
         let tx_hash: Hash = raw.calc_tx_hash().as_slice().try_into().unwrap();
-        if value(&self.events, tx_hash)? != ZERO {
+        let event_key = state_key(EVENT_STATE_NAMESPACE, tx_hash);
+        if value(&self.committed_state, event_key)? != ZERO {
             return Err(BuilderError::InvalidEvent);
         }
-        event_keys.insert(tx_hash);
-        update(&mut self.events, tx_hash, EVENT_PRESENT)?;
+        state_keys.insert(event_key);
+        update(&mut self.committed_state, event_key, EVENT_PRESENT)?;
 
         let spent_out_points = raw
             .inputs()
@@ -504,10 +523,10 @@ impl TallyBuilder {
             .collect::<Vec<_>>();
         let mut relevant = false;
         for out_point in &spent_out_points {
-            let key = out_point.key();
-            let voter = value(&self.dao, key)?;
+            let key = state_key(DAO_STATE_NAMESPACE, out_point.key());
+            let voter = value(&self.committed_state, key)?;
             if voter != ZERO {
-                self.remove_record(voter, vote_keys, dao_keys)?;
+                self.remove_record(voter, vote_keys, state_keys)?;
                 relevant = true;
             }
         }
@@ -557,12 +576,12 @@ impl TallyBuilder {
                     voter_lock_hash,
                     direction: vote.direction,
                     amount: vote.amount,
-                    block_number: event.block_number,
-                    tx_index: event.tx_index,
+                    block_number,
+                    tx_index,
                     dao_out_points,
                 },
                 vote_keys,
-                dao_keys,
+                state_keys,
             )?;
             relevant = true;
         }
@@ -579,7 +598,11 @@ impl TallyBuilder {
         raw: &RawTransaction,
     ) -> Result<bool, BuilderError> {
         for input in raw.inputs().into_iter() {
-            if value(&self.dao, unpack_out_point(&input.previous_output()).key())? != ZERO {
+            let dao_key = state_key(
+                DAO_STATE_NAMESPACE,
+                unpack_out_point(&input.previous_output()).key(),
+            );
+            if value(&self.committed_state, dao_key)? != ZERO {
                 return Ok(true);
             }
         }
@@ -596,22 +619,24 @@ impl TallyBuilder {
         &mut self,
         voter: Hash,
         vote_keys: &mut BTreeSet<Hash>,
-        dao_keys: &mut BTreeSet<Hash>,
+        state_keys: &mut BTreeSet<Hash>,
     ) -> Result<(), BuilderError> {
         vote_keys.insert(voter);
+        let vote_key = state_key(VOTE_STATE_NAMESPACE, voter);
+        state_keys.insert(vote_key);
         let record = self
             .records
             .remove(&voter)
             .ok_or(BuilderError::MissingStateKey)?;
-        update(&mut self.votes, voter, ZERO)?;
+        update(&mut self.committed_state, vote_key, ZERO)?;
         self.subtract_tally(record.direction, record.amount)?;
         for out_point in record.dao_out_points {
-            let key = out_point.key();
-            dao_keys.insert(key);
-            if value(&self.dao, key)? != voter {
+            let key = state_key(DAO_STATE_NAMESPACE, out_point.key());
+            state_keys.insert(key);
+            if value(&self.committed_state, key)? != voter {
                 return Err(BuilderError::InvalidState);
             }
-            update(&mut self.dao, key, ZERO)?;
+            update(&mut self.committed_state, key, ZERO)?;
         }
         Ok(())
     }
@@ -620,24 +645,26 @@ impl TallyBuilder {
         &mut self,
         record: VoteRecord,
         vote_keys: &mut BTreeSet<Hash>,
-        dao_keys: &mut BTreeSet<Hash>,
+        state_keys: &mut BTreeSet<Hash>,
     ) -> Result<(), BuilderError> {
         let voter = record.voter_lock_hash;
         vote_keys.insert(voter);
-        if value(&self.votes, voter)? != ZERO {
-            self.remove_record(voter, vote_keys, dao_keys)?;
+        let vote_key = state_key(VOTE_STATE_NAMESPACE, voter);
+        state_keys.insert(vote_key);
+        if value(&self.committed_state, vote_key)? != ZERO {
+            self.remove_record(voter, vote_keys, state_keys)?;
         }
         for out_point in &record.dao_out_points {
-            let key = out_point.key();
-            dao_keys.insert(key);
-            if value(&self.dao, key)? != ZERO {
+            let key = state_key(DAO_STATE_NAMESPACE, out_point.key());
+            state_keys.insert(key);
+            if value(&self.committed_state, key)? != ZERO {
                 return Err(BuilderError::InvalidState);
             }
-            update(&mut self.dao, key, voter)?;
+            update(&mut self.committed_state, key, voter)?;
         }
         self.add_tally(record.direction, record.amount)?;
         let record_hash = record.value_hash().map_err(|_| BuilderError::Encoding)?;
-        update(&mut self.votes, voter, record_hash)?;
+        update(&mut self.committed_state, vote_key, record_hash)?;
         self.records.insert(voter, record);
         Ok(())
     }
@@ -669,12 +696,56 @@ impl TallyBuilder {
     fn clone_builder(&self) -> Self {
         Self {
             state: self.state.clone(),
-            votes: clone_tree(&self.votes),
-            dao: clone_tree(&self.dao),
-            events: clone_tree(&self.events),
+            committed_state: clone_tree(&self.committed_state),
             records: self.records.clone(),
         }
     }
+}
+
+pub fn prove_block_transactions(
+    block_number: u64,
+    header_dep_index: u16,
+    raw_transactions: &[Vec<u8>],
+    witnesses_root: Hash,
+    tx_indices: &[u32],
+) -> Result<ProvenBlock, BuilderError> {
+    if raw_transactions.is_empty()
+        || tx_indices.is_empty()
+        || tx_indices.windows(2).any(|pair| pair[0] >= pair[1])
+        || tx_indices
+            .iter()
+            .any(|index| *index as usize >= raw_transactions.len())
+    {
+        return Err(BuilderError::InvalidEvent);
+    }
+    let hashes = raw_transactions
+        .iter()
+        .map(|raw| {
+            RawTransaction::from_slice(raw)
+                .map(|tx| tx.calc_tx_hash().as_slice().try_into().unwrap())
+                .map_err(|_| BuilderError::InvalidEvent)
+        })
+        .collect::<Result<Vec<Hash>, _>>()?;
+    let proof = CBMT::<Hash, MergeHash>::build_merkle_proof(&hashes, tx_indices)
+        .ok_or(BuilderError::InvalidEvent)?;
+    let transactions = tx_indices
+        .iter()
+        .map(|index| ProvenBlockTransaction {
+            tx_index: *index,
+            raw_transaction: raw_transactions[*index as usize].clone(),
+        })
+        .collect();
+    Ok(ProvenBlock {
+        block_number,
+        header_dep_index,
+        tx_count: hashes
+            .len()
+            .try_into()
+            .map_err(|_| BuilderError::BatchLimit)?,
+        witnesses_root,
+        transactions,
+        lemmas: proof.lemmas().to_vec(),
+    })
 }
 
 pub fn prove_transaction(
@@ -751,6 +822,10 @@ fn root(tree: &Smt) -> Hash {
     (*tree.root()).into()
 }
 
+fn state_key(namespace: u8, key: Hash) -> Hash {
+    namespaced_state_key(namespace, key).expect("fixed state namespace")
+}
+
 fn clone_tree(tree: &Smt) -> Smt {
     Smt::new(*tree.root(), tree.store().clone())
 }
@@ -779,7 +854,9 @@ mod tests {
     use super::*;
     use ckb_gen_types::bytes::Bytes;
     use ckb_gen_types::packed;
-    use treasury_common::{ProposalPhase, verify_cbmt_inclusion, verify_smt_transition};
+    use treasury_common::{
+        ProposalPhase, cbmt_multi_root, verify_cbmt_inclusion, verify_smt_transition,
+    };
 
     fn proposal() -> ProposalData {
         ProposalData {
@@ -877,6 +954,46 @@ mod tests {
     }
 
     #[test]
+    fn builds_canonical_block_multiproof() {
+        let raws = vec![
+            raw_transaction(0),
+            raw_transaction(1),
+            raw_transaction(2),
+            raw_transaction(3),
+        ];
+        let proven = prove_block_transactions(10, 0, &raws, [9; 32], &[0, 2, 3]).unwrap();
+        let indexed = proven
+            .transactions
+            .iter()
+            .map(|transaction| {
+                let raw = RawTransaction::from_slice(&transaction.raw_transaction).unwrap();
+                (
+                    transaction.tx_index,
+                    raw.calc_tx_hash().as_slice().try_into().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let hashes = raws
+            .iter()
+            .map(|raw| {
+                RawTransaction::from_slice(raw)
+                    .unwrap()
+                    .calc_tx_hash()
+                    .as_slice()
+                    .try_into()
+                    .unwrap()
+            })
+            .collect::<Vec<Hash>>();
+        assert_eq!(
+            cbmt_multi_root(proven.tx_count, &indexed, &proven.lemmas),
+            Some(CBMT::<Hash, MergeHash>::build_merkle_root(&hashes))
+        );
+        assert!(prove_block_transactions(10, 0, &raws, [9; 32], &[2, 1]).is_err());
+        assert!(prove_block_transactions(10, 0, &raws, [9; 32], &[1, 1]).is_err());
+        assert!(prove_block_transactions(10, 0, &raws, [9; 32], &[4]).is_err());
+    }
+
+    #[test]
     fn generated_smt_transition_verifies_with_shared_contract_logic() {
         let mut old = Smt::default();
         let key = [1; 32];
@@ -918,8 +1035,8 @@ mod tests {
         assert_eq!(state.phase, TallyPhase::Candidate);
         assert_eq!(state.votes_root, ZERO);
         assert_eq!(state.yes, 0);
-        assert!(batch.vote_transitions.is_empty());
-        assert!(batch.vote_proof.is_empty());
+        assert!(batch.state_transitions.is_empty());
+        assert!(batch.state_proof.is_empty());
     }
 
     #[test]
@@ -950,8 +1067,8 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(scanned.events.len(), 2);
-        assert_eq!(scanned.events[1].header_dep_index, 1);
+        assert_eq!(scanned.blocks.len(), 2);
+        assert_eq!(scanned.blocks[1].header_dep_index, 1);
         assert_eq!(scanned.header_deps, vec![[10; 32], [11; 32]]);
         assert_eq!((scanned.end_block, scanned.end_tx_index), (12, 0));
 
@@ -959,7 +1076,7 @@ mod tests {
         let (candidate, _) = builder
             .build_batch(
                 &proposal,
-                scanned.events,
+                scanned.blocks,
                 scanned.end_block,
                 scanned.end_tx_index,
                 scanned.candidate_since,
@@ -974,9 +1091,12 @@ mod tests {
         let mut proposal = proposal();
         proposal.end_block = 11;
         let proposal_id = [7; 32];
-        let (vote, spend) = vote_and_spend_transactions(proposal_id);
-        let vote = prove_transaction(10, 0, &[vote], [20; 32], 0).unwrap();
-        let spend = prove_transaction(11, 1, &[spend], [21; 32], 0).unwrap();
+        let (vote_raw, spend_raw) = vote_and_spend_transactions(proposal_id);
+        let vote_block = prove_block_transactions(10, 0, &[vote_raw], [20; 32], &[0]).unwrap();
+        let spend_block =
+            prove_block_transactions(11, 1, core::slice::from_ref(&spend_raw), [21; 32], &[0])
+                .unwrap();
+        let spend = prove_transaction(11, 1, &[spend_raw], [21; 32], 0).unwrap();
         let dao_out_point = OutPoint {
             tx_hash: [9; 32],
             index: 0,
@@ -986,7 +1106,7 @@ mod tests {
         omitted_builder
             .build_batch(
                 &proposal,
-                vec![vote.clone()],
+                vec![vote_block.clone()],
                 proposal.end_block + 1,
                 0,
                 proposal.end_block,
@@ -1002,7 +1122,7 @@ mod tests {
         complete_builder
             .build_batch(
                 &proposal,
-                vec![vote, spend.clone()],
+                vec![vote_block, spend_block],
                 proposal.end_block + 1,
                 0,
                 proposal.end_block,

@@ -15,9 +15,10 @@ use ckb_std::{
     type_id::check_type_id,
 };
 use treasury_common::{
-    BatchWitness, EVENT_PRESENT, Hash, LeafTransition, OutPoint, ProposalData, ProposalPhase,
-    ProvenTransaction, TallyPhase, TallyState, TallyWitness, VoteData, VoteRecord,
-    transactions_root, verify_cbmt_inclusion, verify_smt_transition,
+    BatchWitness, DAO_STATE_NAMESPACE, EVENT_PRESENT, EVENT_STATE_NAMESPACE, Hash, LeafTransition,
+    OutPoint, ProposalData, ProposalPhase, ProvenBlock, ProvenTransaction, TallyPhase, TallyState,
+    TallyWitness, VOTE_STATE_NAMESPACE, VoteData, VoteRecord, cbmt_multi_root,
+    namespaced_state_key, transactions_root, verify_smt_transition,
 };
 
 const ZERO: Hash = [0; 32];
@@ -160,10 +161,9 @@ fn verify_batch(
     proposal: &ProposalData,
     batch: &BatchWitness,
 ) -> Result<(), Error> {
-    if batch.events.len() > proposal.max_events_per_batch as usize
-        || batch.vote_transitions.len() > proposal.max_state_keys_per_batch as usize
-        || batch.dao_transitions.len() > proposal.max_state_keys_per_batch as usize
-        || batch.event_transitions.len() > proposal.max_state_keys_per_batch as usize
+    let event_count = batch.event_count().ok_or(Error::BatchLimit)?;
+    if event_count > proposal.max_events_per_batch as usize
+        || batch.state_transitions.len() > proposal.max_state_keys_per_batch as usize
         || output.sequence > proposal.max_batch_sequence as u32
     {
         return Err(Error::BatchLimit);
@@ -191,7 +191,7 @@ fn verify_batch(
         || output.processed_events
             != input
                 .processed_events
-                .checked_add(batch.events.len() as u64)
+                .checked_add(event_count as u64)
                 .ok_or(Error::TallyOverflow)?
     {
         return Err(Error::InvalidTransition);
@@ -206,15 +206,14 @@ fn verify_batch(
             return Err(Error::InvalidTransition);
         }
     }
+    let input_root = unified_root(input).ok_or(Error::InvalidState)?;
+    let output_root = unified_root(output).ok_or(Error::InvalidState)?;
 
-    if batch.events.is_empty() {
-        if !batch.previous_vote_records.is_empty()
-            || !batch.vote_transitions.is_empty()
-            || !batch.dao_transitions.is_empty()
-            || !batch.event_transitions.is_empty()
-            || !batch.vote_proof.is_empty()
-            || !batch.dao_proof.is_empty()
-            || !batch.event_proof.is_empty()
+    if event_count == 0 {
+        if !batch.blocks.is_empty()
+            || !batch.previous_vote_records.is_empty()
+            || !batch.state_transitions.is_empty()
+            || !batch.state_proof.is_empty()
             || output.votes_root != input.votes_root
             || output.dao_root != input.dao_root
             || output.events_root != input.events_root
@@ -227,139 +226,163 @@ fn verify_batch(
     }
 
     if !verify_smt_transition(
-        input.votes_root,
-        output.votes_root,
-        &batch.vote_proof,
-        &batch.vote_transitions,
-    ) || !verify_smt_transition(
-        input.dao_root,
-        output.dao_root,
-        &batch.dao_proof,
-        &batch.dao_transitions,
-    ) || !verify_smt_transition(
-        input.events_root,
-        output.events_root,
-        &batch.event_proof,
-        &batch.event_transitions,
+        input_root,
+        output_root,
+        &batch.state_proof,
+        &batch.state_transitions,
     ) {
         return Err(Error::SmtProofInvalid);
     }
 
-    let mut vote_values = transition_map(&batch.vote_transitions)?;
-    let mut dao_values = transition_map(&batch.dao_transitions)?;
-    let mut event_values = transition_map(&batch.event_transitions)?;
-    let mut records = initial_records(&batch.previous_vote_records, &vote_values)?;
+    let mut state_values = transition_map(&batch.state_transitions)?;
+    let mut records = initial_records(&batch.previous_vote_records, &state_values)?;
     let mut yes = input.yes;
     let mut no = input.no;
     let mut previous_cursor = None;
+    let mut previous_block = None;
 
-    for event in &batch.events {
-        let cursor = (event.block_number, event.tx_index);
-        if cursor < input_cursor
-            || cursor >= output_cursor
-            || event.block_number < proposal.start_block
-            || event.block_number > proposal.end_block
-            || previous_cursor.is_some_and(|previous| cursor <= previous)
-        {
+    for block in &batch.blocks {
+        if previous_block.is_some_and(|number| number >= block.block_number) {
             return Err(Error::EventOrderInvalid);
         }
-        previous_cursor = Some(cursor);
-        let (raw, tx_hash) = verify_proven_transaction(event)?;
-        let event_value = event_values
-            .get_mut(&tx_hash)
-            .ok_or(Error::ReducerMismatch)?;
-        if *event_value != ZERO {
-            return Err(Error::ReducerMismatch);
-        }
-        *event_value = EVENT_PRESENT;
+        previous_block = Some(block.block_number);
+        for (tx_index, raw, tx_hash) in verify_proven_block(block)? {
+            let cursor = (block.block_number, tx_index);
+            if cursor < input_cursor
+                || cursor >= output_cursor
+                || block.block_number < proposal.start_block
+                || block.block_number > proposal.end_block
+                || previous_cursor.is_some_and(|previous| cursor <= previous)
+            {
+                return Err(Error::EventOrderInvalid);
+            }
+            previous_cursor = Some(cursor);
+            let event_value = state_values
+                .get_mut(&state_key(EVENT_STATE_NAMESPACE, tx_hash))
+                .ok_or(Error::ReducerMismatch)?;
+            if *event_value != ZERO {
+                return Err(Error::ReducerMismatch);
+            }
+            *event_value = EVENT_PRESENT;
 
-        let spent_out_points = raw
-            .inputs()
-            .into_iter()
-            .map(|input| unpack_out_point(&input.previous_output()))
-            .collect::<alloc::vec::Vec<_>>();
-        let mut relevant = false;
-        for out_point in &spent_out_points {
-            let key = out_point.key();
-            if let Some(voter) = dao_values.get(&key).copied().filter(|value| *value != ZERO) {
-                remove_record(
-                    voter,
-                    &mut vote_values,
-                    &mut dao_values,
-                    &mut records,
-                    &mut yes,
-                    &mut no,
-                )?;
-                relevant = true;
+            let spent_out_points = raw
+                .inputs()
+                .into_iter()
+                .map(|input| unpack_out_point(&input.previous_output()))
+                .collect::<alloc::vec::Vec<_>>();
+            let mut relevant = false;
+            for out_point in &spent_out_points {
+                let key = state_key(DAO_STATE_NAMESPACE, out_point.key());
+                if let Some(voter) = state_values
+                    .get(&key)
+                    .copied()
+                    .filter(|value| *value != ZERO)
+                {
+                    remove_record(voter, &mut state_values, &mut records, &mut yes, &mut no)?;
+                    relevant = true;
+                }
             }
-        }
 
-        for (index, output_cell) in raw.outputs().into_iter().enumerate() {
-            let Some(type_script) = output_cell.type_().to_opt() else {
-                continue;
-            };
-            if !is_vote_script(&type_script, proposal, input.proposal_id) {
-                continue;
-            }
-            let output_data = raw
-                .outputs_data()
-                .get(index)
-                .ok_or(Error::TransactionInvalid)?
-                .raw_data();
-            let vote = VoteData::decode(&output_data).map_err(|_| Error::TransactionInvalid)?;
-            if vote.dao_dep_indices.len() > proposal.max_dao_deps_per_vote as usize {
-                return Err(Error::TransactionInvalid);
-            }
-            let voter_lock_hash = output_cell
-                .lock()
-                .calc_script_hash()
-                .as_slice()
-                .try_into()
-                .unwrap();
-            let mut dao_out_points = alloc::vec::Vec::with_capacity(vote.dao_dep_indices.len());
-            for dep_index in vote.dao_dep_indices {
-                let cell_dep = raw
-                    .cell_deps()
-                    .get(dep_index as usize)
-                    .ok_or(Error::TransactionInvalid)?;
-                let out_point = unpack_out_point(&cell_dep.out_point());
-                if spent_out_points.contains(&out_point) {
+            for (index, output_cell) in raw.outputs().into_iter().enumerate() {
+                let Some(type_script) = output_cell.type_().to_opt() else {
+                    continue;
+                };
+                if !is_vote_script(&type_script, proposal, input.proposal_id) {
+                    continue;
+                }
+                let output_data = raw
+                    .outputs_data()
+                    .get(index)
+                    .ok_or(Error::TransactionInvalid)?
+                    .raw_data();
+                let vote = VoteData::decode(&output_data).map_err(|_| Error::TransactionInvalid)?;
+                if vote.dao_dep_indices.len() > proposal.max_dao_deps_per_vote as usize {
                     return Err(Error::TransactionInvalid);
                 }
-                dao_out_points.push(out_point);
+                let voter_lock_hash = output_cell
+                    .lock()
+                    .calc_script_hash()
+                    .as_slice()
+                    .try_into()
+                    .unwrap();
+                let mut dao_out_points = alloc::vec::Vec::with_capacity(vote.dao_dep_indices.len());
+                for dep_index in vote.dao_dep_indices {
+                    let cell_dep = raw
+                        .cell_deps()
+                        .get(dep_index as usize)
+                        .ok_or(Error::TransactionInvalid)?;
+                    let out_point = unpack_out_point(&cell_dep.out_point());
+                    if spent_out_points.contains(&out_point) {
+                        return Err(Error::TransactionInvalid);
+                    }
+                    dao_out_points.push(out_point);
+                }
+                let record = VoteRecord {
+                    voter_lock_hash,
+                    direction: vote.direction,
+                    amount: vote.amount,
+                    block_number: block.block_number,
+                    tx_index,
+                    dao_out_points,
+                };
+                apply_record(record, &mut state_values, &mut records, &mut yes, &mut no)?;
+                relevant = true;
             }
-            let record = VoteRecord {
-                voter_lock_hash,
-                direction: vote.direction,
-                amount: vote.amount,
-                block_number: event.block_number,
-                tx_index: event.tx_index,
-                dao_out_points,
-            };
-            apply_record(
-                record,
-                &mut vote_values,
-                &mut dao_values,
-                &mut records,
-                &mut yes,
-                &mut no,
-            )?;
-            relevant = true;
-        }
-        if !relevant {
-            return Err(Error::EventNotRelevant);
+            if !relevant {
+                return Err(Error::EventNotRelevant);
+            }
         }
     }
 
     if yes != output.yes
         || no != output.no
-        || !matches_new_values(&vote_values, &batch.vote_transitions)
-        || !matches_new_values(&dao_values, &batch.dao_transitions)
-        || !matches_new_values(&event_values, &batch.event_transitions)
+        || !matches_new_values(&state_values, &batch.state_transitions)
     {
         return Err(Error::ReducerMismatch);
     }
     Ok(())
+}
+
+fn verify_proven_block(
+    proven: &ProvenBlock,
+) -> Result<alloc::vec::Vec<(u32, RawTransaction, Hash)>, Error> {
+    if proven.transactions.is_empty() {
+        return Err(Error::TransactionProofInvalid);
+    }
+    let header = load_header(proven.header_dep_index as usize, Source::HeaderDep)
+        .map_err(|_| Error::HeaderInvalid)?;
+    let header_number: u64 = header.raw().number().unpack();
+    if header_number != proven.block_number {
+        return Err(Error::HeaderInvalid);
+    }
+    let mut previous_index = None;
+    let mut transactions = alloc::vec::Vec::with_capacity(proven.transactions.len());
+    let mut indexed_hashes = alloc::vec::Vec::with_capacity(proven.transactions.len());
+    for transaction in &proven.transactions {
+        if transaction.tx_index >= proven.tx_count
+            || previous_index.is_some_and(|index| index >= transaction.tx_index)
+        {
+            return Err(Error::TransactionProofInvalid);
+        }
+        previous_index = Some(transaction.tx_index);
+        let raw = RawTransaction::from_slice(&transaction.raw_transaction)
+            .map_err(|_| Error::TransactionInvalid)?;
+        let tx_hash = raw.calc_tx_hash().as_slice().try_into().unwrap();
+        indexed_hashes.push((transaction.tx_index, tx_hash));
+        transactions.push((transaction.tx_index, raw, tx_hash));
+    }
+    let raw_root = cbmt_multi_root(proven.tx_count, &indexed_hashes, &proven.lemmas)
+        .ok_or(Error::TransactionProofInvalid)?;
+    let expected_transactions_root: Hash = header
+        .raw()
+        .transactions_root()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    if transactions_root(raw_root, proven.witnesses_root) != expected_transactions_root {
+        return Err(Error::TransactionProofInvalid);
+    }
+    Ok(transactions)
 }
 
 fn challenge_vote(
@@ -377,13 +400,14 @@ fn challenge_vote(
             .to_opt()
             .is_some_and(|script| is_vote_script(&script, &proposal, state.proposal_id))
     });
+    let root = unified_root(state).ok_or(Error::InvalidState)?;
     if !has_vote
         || !verify_smt_transition(
-            state.events_root,
-            state.events_root,
+            root,
+            root,
             proof,
             &[LeafTransition {
-                key: tx_hash,
+                key: state_key(EVENT_STATE_NAMESPACE, tx_hash),
                 old_value: ZERO,
                 new_value: ZERO,
             }],
@@ -411,24 +435,25 @@ fn challenge_spend(
         .into_iter()
         .map(|input| unpack_out_point(&input.previous_output()))
         .any(|out_point| out_point == dao_out_point);
+    let root = unified_root(state).ok_or(Error::InvalidState)?;
     if voter_lock_hash == ZERO
         || !spends_claimed_dao
         || !verify_smt_transition(
-            state.events_root,
-            state.events_root,
+            root,
+            root,
             event_proof,
             &[LeafTransition {
-                key: spend_hash,
+                key: state_key(EVENT_STATE_NAMESPACE, spend_hash),
                 old_value: ZERO,
                 new_value: ZERO,
             }],
         )
         || !verify_smt_transition(
-            state.dao_root,
-            state.dao_root,
+            root,
+            root,
             dao_proof,
             &[LeafTransition {
-                key: dao_out_point.key(),
+                key: state_key(DAO_STATE_NAMESPACE, dao_out_point.key()),
                 old_value: voter_lock_hash,
                 new_value: voter_lock_hash,
             }],
@@ -488,19 +513,7 @@ fn merkle_raw_root(tx_hash: Hash, proven: &ProvenTransaction) -> Result<Hash, Er
         .and_then(|base| base.checked_add(proven.tx_index))
         .ok_or(Error::TransactionProofInvalid)?;
     let proof = MerkleProof::<Hash, MergeHash>::new(alloc::vec![tree_index], proven.lemmas.clone());
-    let root = proof
-        .root(&[tx_hash])
-        .ok_or(Error::TransactionProofInvalid)?;
-    if !verify_cbmt_inclusion(
-        tx_hash,
-        proven.tx_index,
-        proven.tx_count,
-        &proven.lemmas,
-        root,
-    ) {
-        return Err(Error::TransactionProofInvalid);
-    }
-    Ok(root)
+    proof.root(&[tx_hash]).ok_or(Error::TransactionProofInvalid)
 }
 
 fn transition_map(transitions: &[LeafTransition]) -> Result<BTreeMap<Hash, Hash>, Error> {
@@ -518,45 +531,41 @@ fn transition_map(transitions: &[LeafTransition]) -> Result<BTreeMap<Hash, Hash>
 
 fn initial_records(
     provided: &[VoteRecord],
-    vote_values: &BTreeMap<Hash, Hash>,
+    state_values: &BTreeMap<Hash, Hash>,
 ) -> Result<BTreeMap<Hash, VoteRecord>, Error> {
     let mut records = BTreeMap::new();
     for record in provided {
-        let key = record.voter_lock_hash;
-        let expected = vote_values.get(&key).ok_or(Error::ReducerMismatch)?;
+        let voter = record.voter_lock_hash;
+        let key = state_key(VOTE_STATE_NAMESPACE, voter);
+        let expected = state_values.get(&key).ok_or(Error::ReducerMismatch)?;
         if *expected != record.value_hash().map_err(|_| Error::ReducerMismatch)?
-            || records.insert(key, record.clone()).is_some()
+            || records.insert(voter, record.clone()).is_some()
         {
             return Err(Error::ReducerMismatch);
         }
-    }
-    if vote_values
-        .iter()
-        .any(|(key, value)| *value != ZERO && !records.contains_key(key))
-    {
-        return Err(Error::ReducerMismatch);
     }
     Ok(records)
 }
 
 fn remove_record(
     voter: Hash,
-    vote_values: &mut BTreeMap<Hash, Hash>,
-    dao_values: &mut BTreeMap<Hash, Hash>,
+    state_values: &mut BTreeMap<Hash, Hash>,
     records: &mut BTreeMap<Hash, VoteRecord>,
     yes: &mut u128,
     no: &mut u128,
 ) -> Result<(), Error> {
     let record = records.remove(&voter).ok_or(Error::ReducerMismatch)?;
-    let vote_value = vote_values.get_mut(&voter).ok_or(Error::ReducerMismatch)?;
+    let vote_value = state_values
+        .get_mut(&state_key(VOTE_STATE_NAMESPACE, voter))
+        .ok_or(Error::ReducerMismatch)?;
     if *vote_value != record.value_hash().map_err(|_| Error::ReducerMismatch)? {
         return Err(Error::ReducerMismatch);
     }
     *vote_value = ZERO;
     subtract_tally(record.direction, record.amount, yes, no)?;
     for out_point in &record.dao_out_points {
-        let dao_value = dao_values
-            .get_mut(&out_point.key())
+        let dao_value = state_values
+            .get_mut(&state_key(DAO_STATE_NAMESPACE, out_point.key()))
             .ok_or(Error::ReducerMismatch)?;
         if *dao_value != voter {
             return Err(Error::ReducerMismatch);
@@ -568,24 +577,24 @@ fn remove_record(
 
 fn apply_record(
     record: VoteRecord,
-    vote_values: &mut BTreeMap<Hash, Hash>,
-    dao_values: &mut BTreeMap<Hash, Hash>,
+    state_values: &mut BTreeMap<Hash, Hash>,
     records: &mut BTreeMap<Hash, VoteRecord>,
     yes: &mut u128,
     no: &mut u128,
 ) -> Result<(), Error> {
     let voter = record.voter_lock_hash;
-    if vote_values
-        .get(&voter)
+    let vote_key = state_key(VOTE_STATE_NAMESPACE, voter);
+    if state_values
+        .get(&vote_key)
         .copied()
         .ok_or(Error::ReducerMismatch)?
         != ZERO
     {
-        remove_record(voter, vote_values, dao_values, records, yes, no)?;
+        remove_record(voter, state_values, records, yes, no)?;
     }
     for out_point in &record.dao_out_points {
-        let value = dao_values
-            .get_mut(&out_point.key())
+        let value = state_values
+            .get_mut(&state_key(DAO_STATE_NAMESPACE, out_point.key()))
             .ok_or(Error::ReducerMismatch)?;
         if *value != ZERO {
             return Err(Error::ReducerMismatch);
@@ -594,7 +603,9 @@ fn apply_record(
     }
     add_tally(record.direction, record.amount, yes, no)?;
     let value_hash = record.value_hash().map_err(|_| Error::ReducerMismatch)?;
-    *vote_values.get_mut(&voter).ok_or(Error::ReducerMismatch)? = value_hash;
+    *state_values
+        .get_mut(&vote_key)
+        .ok_or(Error::ReducerMismatch)? = value_hash;
     if records.insert(voter, record).is_some() {
         return Err(Error::ReducerMismatch);
     }
@@ -621,6 +632,18 @@ fn matches_new_values(values: &BTreeMap<Hash, Hash>, transitions: &[LeafTransiti
     transitions
         .iter()
         .all(|transition| values.get(&transition.key) == Some(&transition.new_value))
+}
+
+fn unified_root(state: &TallyState) -> Option<Hash> {
+    if state.votes_root == state.dao_root && state.dao_root == state.events_root {
+        Some(state.votes_root)
+    } else {
+        None
+    }
+}
+
+fn state_key(namespace: u8, key: Hash) -> Hash {
+    namespaced_state_key(namespace, key).expect("fixed state namespace")
 }
 
 fn unpack_out_point(out_point: &ckb_gen_types::packed::OutPoint) -> OutPoint {

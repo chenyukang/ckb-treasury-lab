@@ -2,7 +2,7 @@
 
 ## Status
 
-This document describes the V1 implementation in `impl/`. Voting transactions,
+This document describes the V3 tally-witness implementation in `impl/`. Voting transactions,
 batch verification, challenges, passing-policy evaluation, treasury payout, burn,
 and grant timelocks execute in CKB-VM. The CKB node does not maintain a tally
 index and does not scan historical voting windows during transaction validation.
@@ -14,7 +14,7 @@ flowchart LR
     P["Open Proposal Cell"] --> V["VoteTx cells on chain"]
     V --> C["Closed Proposal Cell"]
     C --> S["Operator creates TallySession + bond"]
-    S --> B1["Batch 1: CBMT proofs + SMT transition"]
+    S --> B1["Batch 1: block CBMT multiproofs + SMT transition"]
     B1 --> BN["Batch N: consume prior session"]
     BN --> F["FinalCandidate"]
     F -->|"valid omission proof"| X["Candidate removed; bond to challenger"]
@@ -65,23 +65,33 @@ VoteRecord {
 }
 ```
 
-The vote SMT stores `voter_lock_hash -> blake2b(VoteRecord)`. The DAO SMT stores
-`dao_out_point_key -> voter_lock_hash`. When a voter votes again, the batch
-witness reveals the old VoteRecord, proves that its hash is the current vote-SMT
-value, removes all old DAO mappings and old weight, then installs the new record.
-When a referenced DAO deposit is spent, the DAO SMT identifies the voter and the
-same VoteRecord provides the complete list of mappings and weight to remove.
+The unified state SMT uses separate vote, DAO, and event key namespaces. Each
+physical key is `blake2b("CKB Treasury state key V1" || namespace || logical_key)`,
+so the namespaces retain the full hash output instead of reserving or truncating
+key bits. The vote namespace stores `voter_lock_hash -> blake2b(VoteRecord)`,
+while the DAO namespace stores `dao_out_point_key -> voter_lock_hash`. When a
+voter votes again, the batch witness reveals the old VoteRecord, proves that its
+hash is the current vote-leaf value, removes all old DAO mappings and old weight,
+then installs the new record. When a referenced DAO deposit is spent, the DAO
+leaf identifies the voter and the same VoteRecord provides the complete list of
+mappings and weight to remove.
 
 This preimage is required because an SMT value hash alone cannot tell the
 contract which DAO outpoints must be deleted during revote or invalidation.
 
 ## Tally state
 
-Each TallySession commits to three independent SMT roots:
+Each TallySession commits to one domain-separated SMT with three logical namespaces:
 
-- `votes_root`: voter lock hash to VoteRecord hash.
-- `dao_root`: DAO outpoint key to voter lock hash.
-- `events_root`: historical transaction hash to `EVENT_PRESENT`.
+- vote: voter lock hash to VoteRecord hash;
+- DAO: DAO outpoint key to voter lock hash;
+- event: historical transaction hash to `EVENT_PRESENT`.
+
+The current fixed-length `TallyState` layout retains the `votes_root`, `dao_root`,
+and `events_root` fields, but V3 requires all three fields to contain the same
+unified state root. A transition or candidate with unequal roots is invalid. This
+keeps the state layout stable while reducing each non-empty batch to one compiled
+SMT proof verified against both the old and new roots.
 
 It also stores the next scan cursor, sequence number, `yes`, `no`, processed event
 count, operator lock hash, and candidate start block.
@@ -103,22 +113,22 @@ Proposal during finalization.
 ## Batch witness verification
 
 A batch contains only relevant historical transactions: VoteTxs and transactions
-that spend a currently tracked DAO outpoint. For each event it carries:
+that spend a currently tracked DAO outpoint. Events are grouped by block. Each
+block group carries:
 
-- block number and `header_dep` index;
-- transaction index and total transaction count;
-- serialized RawTransaction;
-- block witnesses root;
-- CBMT lemmas for the raw transaction hash.
+- block number, `header_dep` index, total transaction count, and witnesses root;
+- strictly increasing transaction indices and each serialized RawTransaction;
+- one CBMT multiproof shared by all included transactions from that block.
 
 The contract performs the following checks:
 
-1. Load the referenced header and match its block number.
-2. Hash the RawTransaction and verify its CBMT inclusion.
+1. Load each referenced header once and match its block number.
+2. Hash every RawTransaction and verify the block-level CBMT multiproof with each
+   hash bound to its strictly ordered transaction index.
 3. Combine the computed raw-transaction root and supplied witnesses root, then
    require the result to equal the header's `transactions_root`.
-4. Verify one compiled SMT proof against both the old and new roots for every
-   touched key in each of the three trees.
+4. Verify one compiled SMT proof against both the old and new unified roots for
+   every touched, domain-separated key.
 5. Re-run the reducer in `(block_number, tx_index)` order.
 6. Require the recomputed leaf values, totals, event count, cursor, roots, and next
    phase to equal the output TallySession.
@@ -126,10 +136,10 @@ The contract performs the following checks:
 ```mermaid
 flowchart TD
     W["Offline builder emits batch witness"] --> H["Load header_dep"]
-    H --> M["Verify RawTransaction CBMT inclusion"]
-    M --> O["Verify old SMT roots"]
+    H --> M["Verify block CBMT multiproof"]
+    M --> O["Verify old unified SMT root"]
     O --> D["Apply ordered revote and DAO-spend reducer"]
-    D --> N["Verify new SMT roots and yes/no totals"]
+    D --> N["Verify new unified SMT root and yes/no totals"]
     N --> Q["Create next TallySession"]
 ```
 
@@ -137,8 +147,9 @@ The proposal fixes `max_events_per_batch`, `max_dao_deps_per_vote`,
 `max_state_keys_per_batch`, `max_batch_witness_bytes`, and
 `max_batch_sequence`. These are consensus-enforced limits, not SDK hints.
 
-An empty batch is valid only when it preserves all three roots, both tally
-totals, and carries no transitions, prior records, or SMT proofs. This lets a
+An empty batch is valid only when it preserves the unified root in all three
+layout fields, both tally totals, and carries no transitions, prior records, or
+SMT proofs. This lets a
 no-vote proposal, or an empty suffix of a voting window, reach `FinalCandidate`
 without granting the operator any ability to alter state.
 
@@ -162,16 +173,16 @@ final transaction layout remain caller responsibilities.
 
 CBMT proofs prove that every submitted event exists, but they cannot prove that
 the operator submitted every relevant event. Intermediate batches therefore do
-not wait for a challenge period. The complete `events_root` is challenged only
+not wait for a challenge period. The complete event namespace is challenged only
 after the final cursor is reached.
 
-Two V1 challenges are supported:
+Two V3 challenges are supported:
 
 - **Omitted vote**: prove a VoteTx is included in the voting window and prove its
-  transaction hash is absent from `events_root`.
-- **Omitted DAO spend**: prove that the final `dao_root` still maps an outpoint
+  transaction hash is absent from the event namespace.
+- **Omitted DAO spend**: prove that the final DAO namespace still maps an outpoint
   to a nonzero voter, prove a transaction in the voting window spends that
-  outpoint, and prove the spend transaction is absent from `events_root`. This
+  outpoint, and prove the spend transaction is absent from the event namespace. This
   final-state condition prevents an obsolete outpoint from an earlier,
   superseded vote from producing a false challenge.
 
@@ -230,13 +241,29 @@ input Cell's actual creation point and naturally resets for Treasury change.
 ## Implemented verification
 
 - Rust unit tests cover canonical codecs, VoteRecord commitments, policy math,
-  CBMT proofs, and old/new SMT transition proofs.
+  single and block-level CBMT proofs, state-key namespaces, and old/new SMT
+  transition proofs.
+- `ckb-testtool` rejects duplicate or unsorted transaction indices, added or
+  removed CBMT lemmas, wrong block headers, and modified RawTransactions.
 - `ckb-testtool` executes a builder-generated final batch in CKB-VM.
 - `ckb-testtool` executes an omitted-vote challenge and bond slash.
 - `ckb-testtool` executes exact Treasury payout and expired burn paths.
 - CKB node tests cover activation, issuance decomposition, derived-state replay,
-  Cellbase creation, and full block reward verification.
+  Cellbase creation, full block reward verification, and canonical reorg behavior.
+- The reproducible `live-e2e` runner starts the current Treasury-enabled CKB
+  binary and submits real transactions through RPC, tx-pool, proposal, block
+  assembly, and block verification. It mines DAO deposits, an open/closed
+  proposal, and VoteTxs; accepts and then slashes an omitted-vote candidate;
+  accepts the complete candidate; finalizes a passed Result Cell; and consumes a
+  consensus-created Treasury Cell for payout.
+- In the validated run, the incomplete candidate and challenge committed in
+  blocks 56 and 60. The complete candidate, finalization, and payout committed in
+  blocks 68, 72, and 76. The tally was 2,100 CKB YES and 0 NO; the payout sent
+  100 CKB and preserved the exact Treasury change.
+- The RPC adapter accepts both current 5-field Molecule `BlockV1` responses and
+  legacy 4-field `Block` responses, and verifies their transaction roots before
+  building proofs.
 
-Remaining production work includes deployment manifests, wallet/signing and
-transaction-assembly tooling, explicit reorg and live-devnet suites, larger
-adversarial suites, real VoteTx cycle benchmarks, and final parameter selection.
+Remaining production work includes deployment manifests, production
+wallet/signing and transaction-assembly tooling, complex-event benchmarks,
+larger multi-batch soak tests, and final parameter selection.

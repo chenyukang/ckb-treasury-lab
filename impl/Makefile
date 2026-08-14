@@ -73,7 +73,7 @@ check:
 	cargo check $(CARGO_ARGS)
 
 clippy:
-	cargo clippy -p treasury-common -p tally-builder -p contract-tests --all-targets -- -D warnings
+	cargo clippy -p treasury-common -p tally-builder -p live-e2e -p contract-tests --all-targets -- -D warnings
 	@set -eu; for contract in $(wildcard contracts/*); do \
 		if [ -f $$contract/Makefile ]; then $(MAKE) -e -C $$contract clippy; fi; \
 	done

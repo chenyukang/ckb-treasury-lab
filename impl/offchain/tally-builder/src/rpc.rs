@@ -49,10 +49,22 @@ pub struct CkbRpcClient {
 
 impl CkbRpcClient {
     pub fn new(endpoint: &str) -> Result<Self, RpcError> {
+        Self::with_proxy(endpoint, true)
+    }
+
+    /// Creates a client that bypasses host proxy configuration for a local node.
+    pub fn new_direct(endpoint: &str) -> Result<Self, RpcError> {
+        Self::with_proxy(endpoint, false)
+    }
+
+    fn with_proxy(endpoint: &str, use_proxy: bool) -> Result<Self, RpcError> {
         let endpoint =
             Url::parse(endpoint).map_err(|error| RpcError::InvalidUrl(error.to_string()))?;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+        let mut client = Client::builder().timeout(Duration::from_secs(30));
+        if !use_proxy {
+            client = client.no_proxy();
+        }
+        let client = client
             .build()
             .map_err(|error| RpcError::Transport(error.to_string()))?;
         Ok(Self {
@@ -125,12 +137,22 @@ fn chain_block_from_packed(
     expected_number: u64,
     serialized: &[u8],
 ) -> Result<ChainBlock, RpcError> {
-    let block = packed::Block::from_slice(serialized).map_err(|_| RpcError::InvalidBlock)?;
-    let block_number: u64 = block.header().raw().number().unpack();
+    let (header, transactions) = if let Ok(block) = packed::BlockV1::from_slice(serialized) {
+        (
+            block.header(),
+            block.transactions().into_iter().collect::<Vec<_>>(),
+        )
+    } else {
+        let block = packed::Block::from_slice(serialized).map_err(|_| RpcError::InvalidBlock)?;
+        (
+            block.header(),
+            block.transactions().into_iter().collect::<Vec<_>>(),
+        )
+    };
+    let block_number: u64 = header.raw().number().unpack();
     if block_number != expected_number {
         return Err(RpcError::InvalidBlock);
     }
-    let transactions = block.transactions().into_iter().collect::<Vec<_>>();
     if transactions.is_empty() {
         return Err(RpcError::InvalidBlock);
     }
@@ -157,8 +179,7 @@ fn chain_block_from_packed(
         .collect::<Vec<Hash>>();
     let raw_root = CBMT::<Hash, MergeHash>::build_merkle_root(&raw_hashes);
     let witnesses_root = CBMT::<Hash, MergeHash>::build_merkle_root(&witness_hashes);
-    let header_transactions_root: Hash = block
-        .header()
+    let header_transactions_root: Hash = header
         .raw()
         .transactions_root()
         .as_slice()
@@ -169,19 +190,8 @@ fn chain_block_from_packed(
     }
     Ok(ChainBlock {
         block_number,
-        block_hash: block
-            .header()
-            .calc_header_hash()
-            .as_slice()
-            .try_into()
-            .unwrap(),
-        parent_hash: block
-            .header()
-            .raw()
-            .parent_hash()
-            .as_slice()
-            .try_into()
-            .unwrap(),
+        block_hash: header.calc_header_hash().as_slice().try_into().unwrap(),
+        parent_hash: header.raw().parent_hash().as_slice().try_into().unwrap(),
         raw_transactions: transactions
             .iter()
             .map(|transaction| transaction.raw().as_slice().to_vec())
@@ -205,6 +215,7 @@ struct JsonRpcFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ckb_gen_types::bytes::Bytes;
     use ckb_gen_types::packed::{Block, RawTransaction, Transaction};
 
     #[test]
@@ -243,5 +254,13 @@ mod tests {
         assert_eq!(adapted.witnesses_root, witness_hash);
         assert_eq!(adapted.raw_transactions.len(), 1);
         assert!(chain_block_from_packed(41, block.as_slice()).is_err());
+
+        let block_v1 = packed::BlockV1::new_builder()
+            .header(block.header())
+            .transactions(block.transactions())
+            .extension(Bytes::new().pack())
+            .build();
+        let adapted_v1 = chain_block_from_packed(42, block_v1.as_slice()).unwrap();
+        assert_eq!(adapted_v1, adapted);
     }
 }
