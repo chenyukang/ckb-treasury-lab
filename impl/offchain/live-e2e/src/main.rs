@@ -292,6 +292,19 @@ fn run() -> AnyResult<()> {
         DATA1_HASH_TYPE,
         &packed_hash(&policy_config_type.calc_script_hash()),
     );
+    let genesis_input = packed::CellInput::new_cellbase_input(0);
+    let mut type_id_code_hash = [0; 32];
+    type_id_code_hash[25..].copy_from_slice(b"TYPE_ID");
+    let dao_code_type = script(
+        type_id_code_hash,
+        TYPE_HASH_TYPE,
+        &type_id(&genesis_input, 2),
+    );
+    let dao_type = script(
+        packed_hash(&dao_code_type.calc_script_hash()),
+        TYPE_HASH_TYPE,
+        &[],
+    );
     let treasury_lock = script(
         treasury_code_hash,
         DATA1_HASH_TYPE,
@@ -303,6 +316,15 @@ fn run() -> AnyResult<()> {
         minimum_total_votes: 2_000 * CKB as u128,
         maximum_proposal_amount: 1_000 * CKB,
         treasury_lock_hash: packed_hash(&treasury_lock.calc_script_hash()),
+        dao_code_hash: packed_hash(&dao_type.code_hash()),
+        dao_hash_type: TYPE_HASH_TYPE,
+        proposal_code_hash: *code_hashes.get("proposal").unwrap(),
+        proposal_hash_type: DATA1_HASH_TYPE,
+        vote_code_hash: *code_hashes.get("vote").unwrap(),
+        vote_hash_type: DATA1_HASH_TYPE,
+        tally_code_hash: *code_hashes.get("tally").unwrap(),
+        tally_hash_type: DATA1_HASH_TYPE,
+        policy_type_hash: packed_hash(&policy_script.calc_script_hash()),
     };
     let treasury_config = TreasuryConfig {
         burn_expiry_blocks: 100,
@@ -369,11 +391,14 @@ fn run() -> AnyResult<()> {
         .type_()
         .to_opt()
         .ok_or_else(|| other("genesis DAO code cell has no Type ID"))?;
-    let dao_type = script(
+    let deployed_dao_type = script(
         packed_hash(&dao_code_type.calc_script_hash()),
         TYPE_HASH_TYPE,
         &[],
     );
+    if deployed_dao_type != dao_type {
+        return Err(other("genesis DAO Type Script differs from PolicyConfig"));
+    }
 
     let proposer_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x01]);
     let voter1_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x11]);
@@ -477,12 +502,17 @@ fn run() -> AnyResult<()> {
         vote_hash_type: DATA1_HASH_TYPE,
         tally_code_hash: *code_hashes.get("tally").unwrap(),
         tally_hash_type: DATA1_HASH_TYPE,
+        policy_config_type_hash: packed_hash(&policy_config_type.calc_script_hash()),
         policy_type_hash: packed_hash(&policy_script.calc_script_hash()),
         metadata_hash: blake2b_256(b"live E2E proposal"),
     };
     let proposal_tx = transaction(
         vec![proposal_input],
-        vec![code_dep(&code_cells.always), code_dep(&code_cells.proposal)],
+        vec![
+            code_dep(&code_cells.always),
+            code_dep(&code_cells.proposal),
+            code_dep(&policy_config_cell.out_point),
+        ],
         vec![],
         vec![output(
             1_500 * CKB,
@@ -516,6 +546,7 @@ fn run() -> AnyResult<()> {
         &voter1_lock,
         &vote_type,
         &open_proposal_cell,
+        &policy_config_cell,
         &dao1_cell,
         1_000 * CKB,
     )?;
@@ -527,6 +558,7 @@ fn run() -> AnyResult<()> {
         &voter2_lock,
         &vote_type,
         &open_proposal_cell,
+        &policy_config_cell,
         &dao2_cell,
         1_100 * CKB,
     )?;
@@ -1191,13 +1223,14 @@ fn submit_vote(
     voter_lock: &packed::Script,
     vote_type: &packed::Script,
     proposal: &CellRef,
+    policy_config: &CellRef,
     dao: &CellRef,
     amount: u64,
 ) -> AnyResult<Commit> {
     let vote_data = VoteData {
         direction: 1,
         amount,
-        dao_dep_indices: vec![3],
+        dao_dep_indices: vec![4],
     }
     .encode()
     .map_err(|error| other(format!("encode vote: {error:?}")))?;
@@ -1207,6 +1240,7 @@ fn submit_vote(
             code_dep(&code.always),
             code_dep(&code.vote),
             code_dep(&proposal.out_point),
+            code_dep(&policy_config.out_point),
             code_dep(&dao.out_point),
         ],
         vec![],

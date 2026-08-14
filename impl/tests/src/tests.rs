@@ -43,9 +43,120 @@ fn proposal(proposal_id: [u8; 32], vote_code_hash: [u8; 32]) -> ProposalData {
         vote_hash_type: 1,
         tally_code_hash: [3; 32],
         tally_hash_type: 2,
+        policy_config_type_hash: [6; 32],
         policy_type_hash: [4; 32],
         metadata_hash: [5; 32],
     }
+}
+
+fn type_id(first_input: &CellInput, output_index: u64) -> [u8; 32] {
+    let mut preimage = first_input.as_slice().to_vec();
+    preimage.extend_from_slice(&output_index.to_le_bytes());
+    blake2b_256(&preimage)
+}
+
+#[test]
+fn proposal_contract_rejects_dao_type_not_anchored_by_policy_config() {
+    let mut context = Context::default();
+    let proposal_code = context.deploy_cell_by_name("proposal-type-script");
+    let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
+    let owner_lock = context
+        .build_script(&always_success, Bytes::from(vec![1]))
+        .unwrap();
+    let config_type = context
+        .build_script(&always_success, Bytes::from(vec![2]))
+        .unwrap();
+    let dao_type = context
+        .build_script(&always_success, Bytes::from(vec![3]))
+        .unwrap();
+    let proposal_identity = context.build_script(&proposal_code, Bytes::new()).unwrap();
+    let config = PolicyConfig {
+        approval_bps: 6_000,
+        minimum_total_votes: 100 * CKB as u128,
+        maximum_proposal_amount: 1_000 * CKB,
+        treasury_lock_hash: [7; 32],
+        dao_code_hash: dao_type.code_hash().as_slice().try_into().unwrap(),
+        dao_hash_type: dao_type.hash_type().as_slice()[0],
+        proposal_code_hash: proposal_identity.code_hash().as_slice().try_into().unwrap(),
+        proposal_hash_type: proposal_identity.hash_type().as_slice()[0],
+        vote_code_hash: [4; 32],
+        vote_hash_type: 1,
+        tally_code_hash: [3; 32],
+        tally_hash_type: 2,
+        policy_type_hash: [4; 32],
+    };
+    let config_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(owner_lock.clone())
+            .type_(Some(config_type.clone()).pack())
+            .build(),
+        Bytes::from(config.encode()),
+    );
+    let funding_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(owner_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+    let funding_input = CellInput::new_builder()
+        .previous_output(funding_cell)
+        .build();
+    let proposal_type = context
+        .build_script(
+            &proposal_code,
+            Bytes::from(type_id(&funding_input, 0).to_vec()),
+        )
+        .unwrap();
+    let proposal_id = proposal_type
+        .calc_script_hash()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let mut proposal = proposal(proposal_id, [4; 32]);
+    proposal.phase = ProposalPhase::Open;
+    proposal.dao_code_hash = config.dao_code_hash;
+    proposal.dao_hash_type = config.dao_hash_type;
+    proposal.policy_config_type_hash = config_type
+        .calc_script_hash()
+        .as_slice()
+        .try_into()
+        .unwrap();
+
+    let build = |data: Vec<u8>| {
+        TransactionBuilder::default()
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(config_cell.clone())
+                    .build(),
+            )
+            .input(funding_input.clone())
+            .output(
+                CellOutput::new_builder()
+                    .capacity(1_000 * CKB)
+                    .lock(owner_lock.clone())
+                    .type_(Some(proposal_type.clone()).pack())
+                    .build(),
+            )
+            .output_data(Bytes::from(data).pack())
+            .build()
+    };
+    let valid = context.complete_tx(build(proposal.encode()));
+    context.verify_tx(&valid, 20_000_000).unwrap();
+
+    proposal.dao_code_hash = [0x99; 32];
+    let forged = context.complete_tx(build(proposal.encode()));
+    assert!(context.verify_tx(&forged, 20_000_000).is_err());
+
+    proposal.dao_code_hash = config.dao_code_hash;
+    proposal.tally_code_hash = [0x98; 32];
+    let forged_tally_identity = context.complete_tx(build(proposal.encode()));
+    assert!(
+        context
+            .verify_tx(&forged_tally_identity, 20_000_000)
+            .is_err()
+    );
 }
 
 fn historical_vote_raw(
@@ -139,7 +250,7 @@ fn historical_unique_vote_raw(
 }
 
 #[test]
-fn vote_contract_uses_proposal_configured_dao_type() {
+fn vote_contract_uses_policy_configured_dao_type() {
     let mut context = Context::default();
     let vote_code = context.deploy_cell_by_name("vote-type-script");
     let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
@@ -155,6 +266,9 @@ fn vote_contract_uses_proposal_configured_dao_type() {
         .try_into()
         .unwrap();
     let dao_type = context.build_script(&always_success, Bytes::new()).unwrap();
+    let config_type = context
+        .build_script(&always_success, Bytes::from(vec![3]))
+        .unwrap();
     let vote_type = context
         .build_script(&vote_code, Bytes::from(proposal_id.to_vec()))
         .unwrap();
@@ -166,12 +280,41 @@ fn vote_contract_uses_proposal_configured_dao_type() {
     proposal.dao_code_hash = dao_type.code_hash().as_slice().try_into().unwrap();
     proposal.dao_hash_type = dao_type.hash_type().as_slice()[0];
     proposal.vote_hash_type = vote_type.hash_type().as_slice()[0];
+    proposal.policy_config_type_hash = config_type
+        .calc_script_hash()
+        .as_slice()
+        .try_into()
+        .unwrap();
+
+    let policy_config = PolicyConfig {
+        approval_bps: 6_000,
+        minimum_total_votes: 100 * CKB as u128,
+        maximum_proposal_amount: 1_000 * CKB,
+        treasury_lock_hash: [7; 32],
+        dao_code_hash: proposal.dao_code_hash,
+        dao_hash_type: proposal.dao_hash_type,
+        proposal_code_hash: proposal_type.code_hash().as_slice().try_into().unwrap(),
+        proposal_hash_type: proposal_type.hash_type().as_slice()[0],
+        vote_code_hash: vote_type.code_hash().as_slice().try_into().unwrap(),
+        vote_hash_type: vote_type.hash_type().as_slice()[0],
+        tally_code_hash: proposal.tally_code_hash,
+        tally_hash_type: proposal.tally_hash_type,
+        policy_type_hash: proposal.policy_type_hash,
+    };
+    let config_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(owner_lock.clone())
+            .type_(Some(config_type).pack())
+            .build(),
+        Bytes::from(policy_config.encode()),
+    );
 
     let proposal_cell = context.create_cell(
         CellOutput::new_builder()
             .capacity(1_000 * CKB)
             .lock(owner_lock.clone())
-            .type_(Some(proposal_type).pack())
+            .type_(Some(proposal_type.clone()).pack())
             .build(),
         Bytes::from(proposal.encode()),
     );
@@ -194,7 +337,7 @@ fn vote_contract_uses_proposal_configured_dao_type() {
     let vote_data = VoteData {
         direction: 1,
         amount: dao_capacity,
-        dao_dep_indices: vec![1],
+        dao_dep_indices: vec![2],
     }
     .encode()
     .unwrap();
@@ -202,6 +345,57 @@ fn vote_contract_uses_proposal_configured_dao_type() {
         .cell_dep(
             CellDep::new_builder()
                 .out_point(proposal_cell.clone())
+                .build(),
+        )
+        .cell_dep(
+            CellDep::new_builder()
+                .out_point(config_cell.clone())
+                .build(),
+        )
+        .cell_dep(CellDep::new_builder().out_point(dao_cell.clone()).build())
+        .input(
+            CellInput::new_builder()
+                .previous_output(owner_input.clone())
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(500 * CKB)
+                .lock(owner_lock.clone())
+                .type_(Some(vote_type.clone()).pack())
+                .build(),
+        )
+        .output_data(Bytes::from(vote_data).pack())
+        .build();
+    let tx = context.complete_tx(tx);
+    context.verify_tx(&tx, 20_000_000).unwrap();
+
+    let mut forged_proposal = proposal;
+    forged_proposal.dao_code_hash = [0x99; 32];
+    let forged_proposal_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(owner_lock.clone())
+            .type_(Some(proposal_type).pack())
+            .build(),
+        Bytes::from(forged_proposal.encode()),
+    );
+    let forged_vote_data = VoteData {
+        direction: 1,
+        amount: dao_capacity,
+        dao_dep_indices: vec![2],
+    }
+    .encode()
+    .unwrap();
+    let forged = TransactionBuilder::default()
+        .cell_dep(
+            CellDep::new_builder()
+                .out_point(forged_proposal_cell)
+                .build(),
+        )
+        .cell_dep(
+            CellDep::new_builder()
+                .out_point(config_cell.clone())
                 .build(),
         )
         .cell_dep(CellDep::new_builder().out_point(dao_cell.clone()).build())
@@ -217,20 +411,21 @@ fn vote_contract_uses_proposal_configured_dao_type() {
                 .type_(Some(vote_type.clone()).pack())
                 .build(),
         )
-        .output_data(Bytes::from(vote_data).pack())
+        .output_data(Bytes::from(forged_vote_data).pack())
         .build();
-    let tx = context.complete_tx(tx);
-    context.verify_tx(&tx, 20_000_000).unwrap();
+    let forged = context.complete_tx(forged);
+    assert!(context.verify_tx(&forged, 20_000_000).is_err());
 
     let invalid_vote_data = VoteData {
         direction: 1,
         amount: dao_capacity,
-        dao_dep_indices: vec![1],
+        dao_dep_indices: vec![2],
     }
     .encode()
     .unwrap();
     let invalid = TransactionBuilder::default()
         .cell_dep(CellDep::new_builder().out_point(proposal_cell).build())
+        .cell_dep(CellDep::new_builder().out_point(config_cell).build())
         .cell_dep(CellDep::new_builder().out_point(dao_cell.clone()).build())
         .input(CellInput::new_builder().previous_output(dao_cell).build())
         .output(
@@ -244,6 +439,160 @@ fn vote_contract_uses_proposal_configured_dao_type() {
         .build();
     let invalid = context.complete_tx(invalid);
     assert!(context.verify_tx(&invalid, 20_000_000).is_err());
+}
+
+#[test]
+fn policy_contract_rejects_proposal_bound_to_different_config() {
+    let mut context = Context::default();
+    let policy_code = context.deploy_cell_by_name("policy-type-script");
+    let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
+    let owner_lock = context
+        .build_script(&always_success, Bytes::from(vec![1]))
+        .unwrap();
+    let config_type = context
+        .build_script(&always_success, Bytes::from(vec![2]))
+        .unwrap();
+    let proposal_type = context
+        .build_script(&always_success, Bytes::from(vec![3]))
+        .unwrap();
+    let tally_type = context
+        .build_script_with_hash_type(&always_success, ScriptHashType::Data1, Bytes::from(vec![4]))
+        .unwrap();
+    let policy_type = context
+        .build_script(&policy_code, config_type.calc_script_hash().as_bytes())
+        .unwrap();
+    let config = PolicyConfig {
+        approval_bps: 6_000,
+        minimum_total_votes: 1,
+        maximum_proposal_amount: 1_000 * CKB,
+        treasury_lock_hash: [7; 32],
+        dao_code_hash: [8; 32],
+        dao_hash_type: 1,
+        proposal_code_hash: proposal_type.code_hash().as_slice().try_into().unwrap(),
+        proposal_hash_type: proposal_type.hash_type().as_slice()[0],
+        vote_code_hash: [5; 32],
+        vote_hash_type: 1,
+        tally_code_hash: tally_type.code_hash().as_slice().try_into().unwrap(),
+        tally_hash_type: tally_type.hash_type().as_slice()[0],
+        policy_type_hash: policy_type
+            .calc_script_hash()
+            .as_slice()
+            .try_into()
+            .unwrap(),
+    };
+    let config_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(owner_lock.clone())
+            .type_(Some(config_type.clone()).pack())
+            .build(),
+        Bytes::from(config.encode()),
+    );
+    let proposal_id = proposal_type
+        .calc_script_hash()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let mut proposal = proposal(proposal_id, [5; 32]);
+    proposal.dao_code_hash = config.dao_code_hash;
+    proposal.dao_hash_type = config.dao_hash_type;
+    proposal.tally_code_hash = tally_type.code_hash().as_slice().try_into().unwrap();
+    proposal.tally_hash_type = tally_type.hash_type().as_slice()[0];
+    proposal.policy_config_type_hash = config_type
+        .calc_script_hash()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    proposal.policy_type_hash = policy_type
+        .calc_script_hash()
+        .as_slice()
+        .try_into()
+        .unwrap();
+
+    let candidate = TallyState {
+        phase: TallyPhase::Candidate,
+        proposal_id,
+        operator_lock_hash: [9; 32],
+        sequence: 1,
+        next_block: proposal.end_block + 1,
+        next_tx_index: 0,
+        votes_root: [10; 32],
+        dao_root: [11; 32],
+        events_root: [12; 32],
+        yes: 2_000 * CKB as u128,
+        no: 0,
+        processed_events: 1,
+        candidate_since: proposal.end_block + 1,
+    };
+    let candidate_data = candidate.encode();
+    let candidate_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(2_000 * CKB)
+            .lock(owner_lock.clone())
+            .type_(Some(tally_type).pack())
+            .build(),
+        Bytes::from(candidate_data.clone()),
+    );
+    let result = ResultData {
+        passed: true,
+        proposal_id,
+        requested_amount: proposal.requested_amount,
+        receiver_lock_hash: proposal.receiver_lock_hash,
+        yes: candidate.yes,
+        no: candidate.no,
+        final_state_hash: blake2b_256(&candidate_data),
+        policy_data_hash: blake2b_256(&config.encode()),
+    };
+    let valid_proposal_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(owner_lock.clone())
+            .type_(Some(proposal_type.clone()).pack())
+            .build(),
+        Bytes::from(proposal.encode()),
+    );
+    let mut forged_proposal = proposal;
+    forged_proposal.policy_config_type_hash = [0x99; 32];
+    let forged_proposal_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(owner_lock.clone())
+            .type_(Some(proposal_type).pack())
+            .build(),
+        Bytes::from(forged_proposal.encode()),
+    );
+    let build = |proposal_cell: OutPoint| {
+        TransactionBuilder::default()
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(config_cell.clone())
+                    .build(),
+            )
+            .input(
+                CellInput::new_builder()
+                    .previous_output(proposal_cell)
+                    .build(),
+            )
+            .input(
+                CellInput::new_builder()
+                    .previous_output(candidate_cell.clone())
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(1_000 * CKB)
+                    .lock(owner_lock.clone())
+                    .type_(Some(policy_type.clone()).pack())
+                    .build(),
+            )
+            .output_data(Bytes::from(result.encode()).pack())
+            .build()
+    };
+    let valid = context.complete_tx(build(valid_proposal_cell));
+    context.verify_tx(&valid, 20_000_000).unwrap();
+
+    let forged = context.complete_tx(build(forged_proposal_cell));
+    assert!(context.verify_tx(&forged, 20_000_000).is_err());
 }
 
 #[test]
@@ -987,6 +1336,15 @@ fn treasury_payout_preserves_treasury_capacity() {
                     .as_slice()
                     .try_into()
                     .unwrap(),
+                dao_code_hash: [9; 32],
+                dao_hash_type: 1,
+                proposal_code_hash: [10; 32],
+                proposal_hash_type: 1,
+                vote_code_hash: [11; 32],
+                vote_hash_type: 1,
+                tally_code_hash: [12; 32],
+                tally_hash_type: 1,
+                policy_type_hash: [13; 32],
             }
             .encode(),
         ),

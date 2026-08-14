@@ -20,12 +20,14 @@ dao_dep_indices: dao_dep_count * Uint16
 ```
 
 On creation, the contract requires one live Open Proposal Cell in `cell_deps`, a
-voter-owned input, and one vote output. DAO dep indices must be strictly
+live immutable Policy Config Cell bound by that Proposal, a voter-owned input,
+and one vote output. DAO dep indices must be strictly
 increasing, within the proposal's configured limit, owned by the vote output
-lock, use the proposal-configured Nervos DAO code hash and hash type, and contain
-eight zero data bytes (deposit phase). Their capacities must sum exactly to
-`amount` and meet the proposal's minimum vote capacity. A referenced DAO cell
-cannot also appear in the VoteTx inputs.
+lock, use the Policy Config's canonical Nervos DAO code hash and hash type, and
+contain eight zero data bytes (deposit phase). The Proposal's DAO fields must
+match the same configuration. Their capacities must sum exactly to `amount` and
+meet the proposal's minimum vote capacity. A referenced DAO cell cannot also
+appear in the VoteTx inputs.
 
 Consuming a Vote Cell is unrestricted. Settlement uses the historical VoteTx,
 not the continued liveness of the small Vote Cell. The referenced DAO deposits

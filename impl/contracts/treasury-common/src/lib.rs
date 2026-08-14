@@ -12,10 +12,10 @@ pub const TALLY_WITNESS_VERSION: u8 = 3;
 pub const VOTE_STATE_NAMESPACE: u8 = 0;
 pub const DAO_STATE_NAMESPACE: u8 = 1;
 pub const EVENT_STATE_NAMESPACE: u8 = 2;
-pub const PROPOSAL_DATA_LEN: usize = 249;
+pub const PROPOSAL_DATA_LEN: usize = 281;
 pub const TALLY_STATE_LEN: usize = 226;
 pub const RESULT_DATA_LEN: usize = 170;
-pub const POLICY_CONFIG_LEN: usize = 59;
+pub const POLICY_CONFIG_LEN: usize = 223;
 pub const TREASURY_CONFIG_LEN: usize = 97;
 pub const EVENT_PRESENT: Hash = [
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -263,6 +263,7 @@ pub struct ProposalData {
     pub vote_hash_type: u8,
     pub tally_code_hash: Hash,
     pub tally_hash_type: u8,
+    pub policy_config_type_hash: Hash,
     pub policy_type_hash: Hash,
     pub metadata_hash: Hash,
 }
@@ -294,6 +295,7 @@ impl ProposalData {
             vote_hash_type: reader.u8()?,
             tally_code_hash: reader.hash()?,
             tally_hash_type: reader.u8()?,
+            policy_config_type_hash: reader.hash()?,
             policy_type_hash: reader.hash()?,
             metadata_hash: reader.hash()?,
         };
@@ -307,6 +309,7 @@ impl ProposalData {
             || value.max_batch_witness_bytes == 0
             || value.minimum_vote_capacity == 0
             || value.requested_amount == 0
+            || value.policy_config_type_hash == [0; 32]
             || !is_valid_script_hash_type(value.dao_hash_type)
             || !is_valid_script_hash_type(value.vote_hash_type)
             || !is_valid_script_hash_type(value.tally_hash_type)
@@ -337,6 +340,7 @@ impl ProposalData {
         output.push(self.vote_hash_type);
         output.extend_from_slice(&self.tally_code_hash);
         output.push(self.tally_hash_type);
+        output.extend_from_slice(&self.policy_config_type_hash);
         output.extend_from_slice(&self.policy_type_hash);
         output.extend_from_slice(&self.metadata_hash);
         output
@@ -473,6 +477,15 @@ pub struct PolicyConfig {
     pub minimum_total_votes: u128,
     pub maximum_proposal_amount: u64,
     pub treasury_lock_hash: Hash,
+    pub dao_code_hash: Hash,
+    pub dao_hash_type: u8,
+    pub proposal_code_hash: Hash,
+    pub proposal_hash_type: u8,
+    pub vote_code_hash: Hash,
+    pub vote_hash_type: u8,
+    pub tally_code_hash: Hash,
+    pub tally_hash_type: u8,
+    pub policy_type_hash: Hash,
 }
 
 impl PolicyConfig {
@@ -487,6 +500,15 @@ impl PolicyConfig {
             minimum_total_votes: reader.u128()?,
             maximum_proposal_amount: reader.u64()?,
             treasury_lock_hash: reader.hash()?,
+            dao_code_hash: reader.hash()?,
+            dao_hash_type: reader.u8()?,
+            proposal_code_hash: reader.hash()?,
+            proposal_hash_type: reader.u8()?,
+            vote_code_hash: reader.hash()?,
+            vote_hash_type: reader.u8()?,
+            tally_code_hash: reader.hash()?,
+            tally_hash_type: reader.u8()?,
+            policy_type_hash: reader.hash()?,
         };
         reader.finish()?;
         if value.approval_bps == 0
@@ -494,6 +516,15 @@ impl PolicyConfig {
             || value.minimum_total_votes == 0
             || value.maximum_proposal_amount == 0
             || value.treasury_lock_hash == [0; 32]
+            || value.dao_code_hash == [0; 32]
+            || value.proposal_code_hash == [0; 32]
+            || value.vote_code_hash == [0; 32]
+            || value.tally_code_hash == [0; 32]
+            || value.policy_type_hash == [0; 32]
+            || !is_valid_script_hash_type(value.dao_hash_type)
+            || !is_valid_script_hash_type(value.proposal_hash_type)
+            || !is_valid_script_hash_type(value.vote_hash_type)
+            || !is_valid_script_hash_type(value.tally_hash_type)
         {
             return Err(CodecError::InvalidValue);
         }
@@ -507,6 +538,15 @@ impl PolicyConfig {
         output.extend_from_slice(&self.minimum_total_votes.to_le_bytes());
         output.extend_from_slice(&self.maximum_proposal_amount.to_le_bytes());
         output.extend_from_slice(&self.treasury_lock_hash);
+        output.extend_from_slice(&self.dao_code_hash);
+        output.push(self.dao_hash_type);
+        output.extend_from_slice(&self.proposal_code_hash);
+        output.push(self.proposal_hash_type);
+        output.extend_from_slice(&self.vote_code_hash);
+        output.push(self.vote_hash_type);
+        output.extend_from_slice(&self.tally_code_hash);
+        output.push(self.tally_hash_type);
+        output.extend_from_slice(&self.policy_type_hash);
         output
     }
 
@@ -1206,6 +1246,7 @@ mod tests {
             vote_hash_type: 1,
             tally_code_hash: [3; 32],
             tally_hash_type: 1,
+            policy_config_type_hash: [6; 32],
             policy_type_hash: [4; 32],
             metadata_hash: [5; 32],
         };
@@ -1235,6 +1276,15 @@ mod tests {
             minimum_total_votes: 100,
             maximum_proposal_amount: 1_000,
             treasury_lock_hash: [6; 32],
+            dao_code_hash: [9; 32],
+            dao_hash_type: 1,
+            proposal_code_hash: [10; 32],
+            proposal_hash_type: 1,
+            vote_code_hash: [11; 32],
+            vote_hash_type: 1,
+            tally_code_hash: [12; 32],
+            tally_hash_type: 1,
+            policy_type_hash: [13; 32],
         };
         assert_eq!(policy.encode().len(), POLICY_CONFIG_LEN);
         assert_eq!(PolicyConfig::decode(&policy.encode()).unwrap(), policy);
@@ -1275,6 +1325,7 @@ mod tests {
             vote_hash_type: 1,
             tally_code_hash: [3; 32],
             tally_hash_type: 1,
+            policy_config_type_hash: [6; 32],
             policy_type_hash: [4; 32],
             metadata_hash: [5; 32],
         };
@@ -1289,6 +1340,15 @@ mod tests {
             minimum_total_votes: 0,
             maximum_proposal_amount: 1_000,
             treasury_lock_hash: [6; 32],
+            dao_code_hash: [9; 32],
+            dao_hash_type: 1,
+            proposal_code_hash: [10; 32],
+            proposal_hash_type: 1,
+            vote_code_hash: [11; 32],
+            vote_hash_type: 1,
+            tally_code_hash: [12; 32],
+            tally_hash_type: 1,
+            policy_type_hash: [13; 32],
         };
         assert_eq!(
             PolicyConfig::decode(&invalid_policy.encode()),
@@ -1316,6 +1376,15 @@ mod tests {
             minimum_total_votes: 100,
             maximum_proposal_amount: 1_000,
             treasury_lock_hash: [9; 32],
+            dao_code_hash: [8; 32],
+            dao_hash_type: 1,
+            proposal_code_hash: [10; 32],
+            proposal_hash_type: 1,
+            vote_code_hash: [11; 32],
+            vote_hash_type: 1,
+            tally_code_hash: [12; 32],
+            tally_hash_type: 1,
+            policy_type_hash: [13; 32],
         };
         assert!(policy.passes(60, 40, 1_000));
         assert!(!policy.passes(59, 41, 1_000));

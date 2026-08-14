@@ -33,9 +33,11 @@ be consumed exactly once by the payout transaction.
   is consumed with one mature FinalCandidate to create one Result Cell.
 - **Vote Cell**: records `YES` or `NO`, the claimed amount, and DAO cell-dep
   indices. Its type args contain the full Proposal type-script hash. The
-  Proposal binds the DAO code hash and hash type, so the contract is not tied to
-  one genesis or network. A DAO outpoint cannot simultaneously be a VoteTx
-  `cell_dep` and an input; both the Vote Script and tally reducer reject this.
+  Proposal binds an immutable Policy Config whose canonical DAO code hash and
+  hash type are checked again by the Vote and Policy scripts. This keeps network
+  identity configurable without allowing a Proposal to self-authorize a fake
+  DAO-like script. A DAO outpoint cannot simultaneously be a VoteTx `cell_dep`
+  and an input; both the Vote Script and tally reducer reject this.
 - **TallySession Cell**: a Type-ID singleton owned logically by one operator. Its
   capacity is the settlement bond. Each batch consumes the previous session and
   creates the next state.
@@ -47,7 +49,9 @@ be consumed exactly once by the payout transaction.
   beneficiary lock hash.
 - **Config Cell**: an immutable Type-ID cell. A policy upgrade creates a new
   Config Cell and therefore a new script hash; existing proposals keep their old
-  rules.
+  rules. Policy Config also commits the canonical Nervos DAO code hash and hash
+  type used as voting collateral, the authorized Proposal, Vote, and Tally code
+  identities, and the exact Policy Type Script hash accepted for settlement.
 
 ## VoteRecord
 
@@ -201,9 +205,13 @@ passed = requested_amount <= maximum_proposal_amount
       && yes * 10_000 >= total * approval_bps
 ```
 
-The Policy Config data hash is committed in the Result Cell. Changing policy
-means deploying a new immutable config version and creating future proposals
-that reference the new Policy script hash. Node Rust code is unaffected.
+The Policy Config data hash is committed in the Result Cell. The Policy script
+also requires the Proposal's `policy_config_type_hash` and DAO identity to match
+the configuration selected by the Result Type Script. It also rechecks the
+Proposal input script and the configured Proposal, Vote, Tally, and Policy
+identities. Changing policy means deploying a new immutable config version and
+creating future proposals that reference the new Policy script hash. Node Rust
+code is unaffected.
 
 ## Treasury payout and burn
 

@@ -12,7 +12,7 @@ use ckb_std::{
         load_cell_type_hash, load_input_out_point, load_script, load_transaction,
     },
 };
-use treasury_common::{ProposalData, ProposalPhase, VoteData};
+use treasury_common::{PolicyConfig, ProposalData, ProposalPhase, VoteData};
 
 #[repr(i8)]
 enum Error {
@@ -28,6 +28,9 @@ enum Error {
     CapacityOverflow,
     MultipleVoteOutputs,
     DaoSpentInVote,
+    ConfigNotFound,
+    ConfigInvalid,
+    ContractIdentityMismatch,
 }
 
 pub fn program_entry() -> i8 {
@@ -50,7 +53,19 @@ fn run() -> Result<(), Error> {
         return Err(Error::MultipleVoteOutputs);
     }
 
-    let proposal = find_open_proposal(proposal_type_hash)?;
+    let (proposal, config) = find_open_proposal(proposal_type_hash)?;
+    if script.code_hash().as_slice() != config.vote_code_hash
+        || script.hash_type().as_slice()[0] != config.vote_hash_type
+        || proposal.dao_code_hash != config.dao_code_hash
+        || proposal.dao_hash_type != config.dao_hash_type
+        || proposal.vote_code_hash != config.vote_code_hash
+        || proposal.vote_hash_type != config.vote_hash_type
+        || proposal.tally_code_hash != config.tally_code_hash
+        || proposal.tally_hash_type != config.tally_hash_type
+        || proposal.policy_type_hash != config.policy_type_hash
+    {
+        return Err(Error::ContractIdentityMismatch);
+    }
     let vote_lock_hash =
         load_cell_lock_hash(0, Source::GroupOutput).map_err(|_| Error::VoteDataInvalid)?;
     if !QueryIter::new(load_cell_lock_hash, Source::Input)
@@ -94,8 +109,8 @@ fn run() -> Result<(), Error> {
         let dep_type = load_cell_type(dep_index, Source::CellDep)
             .map_err(|_| Error::DaoDepInvalid)?
             .ok_or(Error::DaoDepInvalid)?;
-        if dep_type.code_hash().as_slice() != proposal.dao_code_hash
-            || dep_type.hash_type().as_slice()[0] != proposal.dao_hash_type
+        if dep_type.code_hash().as_slice() != config.dao_code_hash
+            || dep_type.hash_type().as_slice()[0] != config.dao_hash_type
             || !dep_type.args().raw_data().is_empty()
         {
             return Err(Error::DaoDepInvalid);
@@ -123,16 +138,35 @@ fn run() -> Result<(), Error> {
     Ok(())
 }
 
-fn find_open_proposal(proposal_type_hash: [u8; 32]) -> Result<ProposalData, Error> {
+fn load_policy_config(config_type_hash: [u8; 32]) -> Result<PolicyConfig, Error> {
+    for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
+        if type_hash == Some(config_type_hash) {
+            let data = load_cell_data(index, Source::CellDep).map_err(|_| Error::ConfigInvalid)?;
+            return PolicyConfig::decode(&data).map_err(|_| Error::ConfigInvalid);
+        }
+    }
+    Err(Error::ConfigNotFound)
+}
+
+fn find_open_proposal(proposal_type_hash: [u8; 32]) -> Result<(ProposalData, PolicyConfig), Error> {
     for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
         if type_hash == Some(proposal_type_hash) {
+            let type_script = load_cell_type(index, Source::CellDep)
+                .map_err(|_| Error::ProposalNotOpen)?
+                .ok_or(Error::ProposalNotOpen)?;
             let data =
                 load_cell_data(index, Source::CellDep).map_err(|_| Error::ProposalNotOpen)?;
             let proposal = ProposalData::decode(&data).map_err(|_| Error::ProposalNotOpen)?;
             if proposal.phase != ProposalPhase::Open {
                 return Err(Error::ProposalNotOpen);
             }
-            return Ok(proposal);
+            let config = load_policy_config(proposal.policy_config_type_hash)?;
+            if type_script.code_hash().as_slice() != config.proposal_code_hash
+                || type_script.hash_type().as_slice()[0] != config.proposal_hash_type
+            {
+                return Err(Error::ContractIdentityMismatch);
+            }
+            return Ok((proposal, config));
         }
     }
     Err(Error::ProposalNotFound)

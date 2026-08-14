@@ -9,12 +9,12 @@ use ckb_std::{
     ckb_types::prelude::{Entity, Unpack},
     high_level::{
         QueryIter, load_cell_capacity, load_cell_data, load_cell_lock_hash, load_cell_type,
-        load_cell_type_hash, load_header, load_script_hash,
+        load_cell_type_hash, load_header, load_script, load_script_hash,
     },
     type_id::check_type_id,
 };
 use treasury_common::{
-    ProposalData, ProposalPhase, ResultData, TallyPhase, TallyState, blake2b_256,
+    PolicyConfig, ProposalData, ProposalPhase, ResultData, TallyPhase, TallyState, blake2b_256,
 };
 
 #[repr(i8)]
@@ -27,6 +27,9 @@ enum Error {
     MissingCandidate,
     MissingResult,
     ResultMismatch,
+    ConfigNotFound,
+    ConfigInvalid,
+    ContractIdentityMismatch,
 }
 
 pub fn program_entry() -> i8 {
@@ -57,6 +60,20 @@ fn create() -> Result<(), Error> {
     if proposal.phase != ProposalPhase::Open {
         return Err(Error::InvalidTransition);
     }
+    let config = load_policy_config(proposal.policy_config_type_hash)?;
+    let script = load_script().map_err(|_| Error::ContractIdentityMismatch)?;
+    if proposal.dao_code_hash != config.dao_code_hash
+        || proposal.dao_hash_type != config.dao_hash_type
+        || script.code_hash().as_slice() != config.proposal_code_hash
+        || script.hash_type().as_slice()[0] != config.proposal_hash_type
+        || proposal.vote_code_hash != config.vote_code_hash
+        || proposal.vote_hash_type != config.vote_hash_type
+        || proposal.tally_code_hash != config.tally_code_hash
+        || proposal.tally_hash_type != config.tally_hash_type
+        || proposal.policy_type_hash != config.policy_type_hash
+    {
+        return Err(Error::ContractIdentityMismatch);
+    }
     Ok(())
 }
 
@@ -74,7 +91,7 @@ fn close() -> Result<(), Error> {
         return Err(Error::InvalidTransition);
     }
     let latest_header = QueryIter::new(load_header, Source::HeaderDep)
-        .map(|header| header.raw().number().unpack())
+        .map(|header| -> u64 { header.raw().number().unpack() })
         .max()
         .ok_or(Error::VotingStillOpen)?;
     if latest_header < input.end_block {
@@ -148,4 +165,14 @@ fn is_tally_script(
 fn load_proposal(index: usize, source: Source) -> Result<ProposalData, Error> {
     let data = load_cell_data(index, source).map_err(|_| Error::InvalidProposalData)?;
     ProposalData::decode(&data).map_err(|_| Error::InvalidProposalData)
+}
+
+fn load_policy_config(config_type_hash: [u8; 32]) -> Result<PolicyConfig, Error> {
+    for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
+        if type_hash == Some(config_type_hash) {
+            let data = load_cell_data(index, Source::CellDep).map_err(|_| Error::ConfigInvalid)?;
+            return PolicyConfig::decode(&data).map_err(|_| Error::ConfigInvalid);
+        }
+    }
+    Err(Error::ConfigNotFound)
 }
