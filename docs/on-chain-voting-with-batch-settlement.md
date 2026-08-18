@@ -104,7 +104,10 @@ keeps the state layout stable while reducing each non-empty batch to one compile
 SMT proof verified against both the old and new roots.
 
 It also stores the next scan cursor, sequence number, `yes`, `no`, processed event
-count, operator lock hash, and candidate start block.
+count, operator lock hash, and the final voting-window anchor. Finalization time is
+not derived from that historical anchor: it uses the Candidate input Cell's
+relative block-number `since`, so the challenge clock starts when the Candidate
+is actually created on chain.
 
 ```mermaid
 stateDiagram-v2
@@ -116,11 +119,13 @@ stateDiagram-v2
 ```
 
 Only a transaction containing an input with the operator lock hash may advance or
-finalize the session. Active batches preserve their lock, while the final batch
-must use Proposal Config's canonical permissionless Candidate lock. A challenge
-is therefore permissionless at both the lock and type-script layers. Competing
-operators may create independent sessions, but only one can consume the singleton
-Closed Proposal during finalization.
+finalize the session. Finalization additionally requires a relative block-number
+`since` at least equal to the proposal challenge period on the Candidate input.
+Active batches preserve their lock, while the final batch must use Proposal
+Config's canonical permissionless Candidate lock. A challenge is therefore
+permissionless at both the lock and type-script layers. Competing operators may
+create independent sessions, but only one can consume the singleton Closed
+Proposal during finalization.
 
 ## Batch witness verification
 

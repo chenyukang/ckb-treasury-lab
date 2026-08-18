@@ -736,7 +736,10 @@ fn run() -> AnyResult<()> {
         complete_candidate.encode(),
     );
 
-    let challenge_deadline = complete_candidate.candidate_since + closed_proposal.challenge_period;
+    let challenge_deadline = complete_candidate_commit
+        .block_number
+        .checked_add(closed_proposal.challenge_period)
+        .ok_or_else(|| other("challenge deadline overflow"))?;
     rpc.mine_to(challenge_deadline)?;
     let passed = proposal_config.passes(
         complete_candidate.yes,
@@ -761,7 +764,10 @@ fn run() -> AnyResult<()> {
     let finalize_tx = transaction(
         vec![
             input(&closed_proposal_cell.out_point),
-            input(&complete_candidate_cell.out_point),
+            input_since(
+                &complete_candidate_cell.out_point,
+                0x8000_0000_0000_0000 | closed_proposal.challenge_period,
+            ),
         ],
         vec![
             code_dep(&code_cells.always),
@@ -770,7 +776,7 @@ fn run() -> AnyResult<()> {
             code_dep(&code_cells.policy),
             code_dep(&proposal_config_cell.out_point),
         ],
-        vec![rpc.block_hash(challenge_deadline)?],
+        vec![],
         vec![
             output(1_500 * CKB, &proposer_lock, Some(policy_script.clone())),
             output(
@@ -1473,6 +1479,13 @@ fn script(code_hash: Hash, hash_type: u8, args: &[u8]) -> packed::Script {
 
 fn input(out_point: &packed::OutPoint) -> packed::CellInput {
     packed::CellInput::new_builder()
+        .previous_output(out_point.clone())
+        .build()
+}
+
+fn input_since(out_point: &packed::OutPoint, since: u64) -> packed::CellInput {
+    packed::CellInput::new_builder()
+        .since(since)
         .previous_output(out_point.clone())
         .build()
 }

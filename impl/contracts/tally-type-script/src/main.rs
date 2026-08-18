@@ -10,8 +10,9 @@ use ckb_std::{
     ckb_constants::Source,
     high_level::{
         QueryIter, load_cell_capacity, load_cell_data, load_cell_lock_hash, load_cell_type,
-        load_cell_type_hash, load_header, load_script, load_witness_args,
+        load_cell_type_hash, load_header, load_input_since, load_script, load_witness_args,
     },
+    since::{LockValue, Since},
     type_id::check_type_id,
 };
 use treasury_common::{
@@ -503,11 +504,16 @@ fn challenge_spend(
 }
 
 fn finalize(state: &TallyState, proposal: &ProposalData) -> Result<(), Error> {
-    let deadline = state
-        .candidate_since
-        .checked_add(proposal.challenge_period)
-        .ok_or(Error::ChallengePeriodOpen)?;
-    if latest_header_number()? < deadline {
+    let since = Since::new(
+        load_input_since(0, Source::GroupInput).map_err(|_| Error::ChallengePeriodOpen)?,
+    );
+    if !since.flags_is_valid()
+        || !since.is_relative()
+        || !matches!(
+            since.extract_lock_value(),
+            Some(LockValue::BlockNumber(blocks)) if blocks >= proposal.challenge_period
+        )
+    {
         return Err(Error::ChallengePeriodOpen);
     }
     require_operator(state.operator_lock_hash)?;

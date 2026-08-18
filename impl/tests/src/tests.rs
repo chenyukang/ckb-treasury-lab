@@ -1417,6 +1417,121 @@ fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
 }
 
 #[test]
+fn tally_finalize_requires_candidate_relative_since() {
+    let mut context = Context::default();
+    let tally_code = context.deploy_cell_by_name("tally-type-script");
+    let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
+    let operator_lock = context
+        .build_script(&always_success, Bytes::from(vec![1]))
+        .unwrap();
+    let candidate_lock = context
+        .build_script(&always_success, Bytes::from(vec![2]))
+        .unwrap();
+    let proposal_type = context
+        .build_script(&always_success, Bytes::from(vec![3]))
+        .unwrap();
+    let proposal_id = proposal_type
+        .calc_script_hash()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let tally_type = context
+        .build_script(&tally_code, Bytes::from(vec![0x7b; 32]))
+        .unwrap();
+    let config = tally_proposal_config(&proposal_type, [0x22; 32], &tally_type, &candidate_lock);
+    let (config_cell, config_hash) =
+        create_proposal_config_dep(&mut context, &always_success, &operator_lock, config);
+    let mut proposal = proposal(proposal_id, [0x22; 32]);
+    proposal.proposal_config_type_hash = config_hash;
+    let proposal_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(operator_lock.clone())
+            .type_(Some(proposal_type).pack())
+            .build(),
+        Bytes::from(proposal.encode()),
+    );
+    let candidate = TallyState {
+        phase: TallyPhase::Candidate,
+        proposal_id,
+        operator_lock_hash: operator_lock
+            .calc_script_hash()
+            .as_slice()
+            .try_into()
+            .unwrap(),
+        sequence: 1,
+        next_block: proposal.end_block + 1,
+        next_tx_index: 0,
+        votes_root: [0; 32],
+        dao_root: [0; 32],
+        events_root: [0; 32],
+        yes: 0,
+        no: 0,
+        processed_events: 0,
+        candidate_since: proposal.end_block,
+    };
+    let bond = 2_000 * CKB;
+    let candidate_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(bond)
+            .lock(candidate_lock)
+            .type_(Some(tally_type).pack())
+            .build(),
+        Bytes::from(candidate.encode()),
+    );
+    let operator_auth = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(100 * CKB)
+            .lock(operator_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+    let finalize_witness = WitnessArgs::new_builder()
+        .input_type(Some(Bytes::from(TallyWitness::Finalize.encode().unwrap())).pack())
+        .build();
+    let build = |relative_blocks: u64| {
+        TransactionBuilder::default()
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(config_cell.clone())
+                    .build(),
+            )
+            .input(
+                CellInput::new_builder()
+                    .since(0x8000_0000_0000_0000 | relative_blocks)
+                    .previous_output(candidate_cell.clone())
+                    .build(),
+            )
+            .input(
+                CellInput::new_builder()
+                    .previous_output(proposal_cell.clone())
+                    .build(),
+            )
+            .input(
+                CellInput::new_builder()
+                    .previous_output(operator_auth.clone())
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(bond)
+                    .lock(operator_lock.clone())
+                    .build(),
+            )
+            .output_data(Bytes::new().pack())
+            .witness(finalize_witness.as_bytes().pack())
+            .build()
+    };
+
+    let backdated = context.complete_tx(build(0));
+    assert!(context.verify_tx(&backdated, 100_000_000).is_err());
+    let too_early = context.complete_tx(build(proposal.challenge_period - 1));
+    assert!(context.verify_tx(&too_early, 100_000_000).is_err());
+    let mature = context.complete_tx(build(proposal.challenge_period));
+    context.verify_tx(&mature, 100_000_000).unwrap();
+}
+
+#[test]
 fn tally_state_encoding_used_by_test_is_canonical() {
     let state = TallyState {
         phase: TallyPhase::Active,
