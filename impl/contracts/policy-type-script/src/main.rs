@@ -9,12 +9,14 @@ use ckb_std::{
     ckb_types::prelude::Entity,
     high_level::{
         QueryIter, load_cell_data, load_cell_lock_hash, load_cell_type, load_cell_type_hash,
-        load_script, load_script_hash,
+        load_script, load_script_hash, load_witness_args,
     },
 };
 use treasury_common::{
     ProposalConfig, ProposalData, ResultData, TallyPhase, TallyState, blake2b_256,
 };
+
+const TREASURY_ACTION_PAYOUT: u8 = 1;
 
 #[repr(i8)]
 enum Error {
@@ -136,9 +138,18 @@ fn consume_result(config: ProposalConfig) -> Result<(), Error> {
     if !result.passed {
         return Ok(());
     }
-    if !QueryIter::new(load_cell_lock_hash, Source::Input)
-        .any(|lock_hash| lock_hash == config.treasury_lock_hash)
-    {
+    let treasury_index = QueryIter::new(load_cell_lock_hash, Source::Input)
+        .enumerate()
+        .find_map(|(index, lock_hash)| (lock_hash == config.treasury_lock_hash).then_some(index))
+        .ok_or(Error::InvalidPayout)?;
+    let witness =
+        load_witness_args(treasury_index, Source::Input).map_err(|_| Error::InvalidPayout)?;
+    let action = witness
+        .lock()
+        .to_opt()
+        .ok_or(Error::InvalidPayout)?
+        .raw_data();
+    if action.as_ref() != [TREASURY_ACTION_PAYOUT] {
         return Err(Error::InvalidPayout);
     }
     Ok(())

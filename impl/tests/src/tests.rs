@@ -783,6 +783,123 @@ fn policy_contract_rejects_proposal_bound_to_different_config() {
 }
 
 #[test]
+fn policy_requires_treasury_payout_action() {
+    let mut context = Context::default();
+    let policy_code = context.deploy_cell_by_name("policy-type-script");
+    let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
+    let ordinary_lock = context
+        .build_script(&always_success, Bytes::from(vec![1]))
+        .unwrap();
+    let treasury_lock = context
+        .build_script(&always_success, Bytes::from(vec![2]))
+        .unwrap();
+    let config_type = context
+        .build_script(&always_success, Bytes::from(vec![3]))
+        .unwrap();
+    let policy_type = context
+        .build_script(&policy_code, config_type.calc_script_hash().as_bytes())
+        .unwrap();
+    let config = ProposalConfig {
+        approval_bps: 6_000,
+        minimum_total_votes: 1,
+        maximum_proposal_amount: 1_000 * CKB,
+        minimum_challenge_period: 5,
+        minimum_tally_bond: 1_000 * CKB,
+        treasury_lock_hash: treasury_lock
+            .calc_script_hash()
+            .as_slice()
+            .try_into()
+            .unwrap(),
+        dao_code_hash: [8; 32],
+        dao_hash_type: 1,
+        proposal_code_hash: [9; 32],
+        proposal_hash_type: 1,
+        vote_code_hash: [10; 32],
+        vote_hash_type: 1,
+        tally_code_hash: [11; 32],
+        tally_hash_type: 1,
+        candidate_lock_hash: [12; 32],
+        policy_type_hash: policy_type
+            .calc_script_hash()
+            .as_slice()
+            .try_into()
+            .unwrap(),
+    };
+    let config_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(ordinary_lock.clone())
+            .type_(Some(config_type).pack())
+            .build(),
+        Bytes::from(config.encode()),
+    );
+    let treasury_input = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(treasury_lock)
+            .build(),
+        Bytes::new(),
+    );
+    let result_input = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(100 * CKB)
+            .lock(ordinary_lock.clone())
+            .type_(Some(policy_type).pack())
+            .build(),
+        Bytes::from(
+            ResultData {
+                passed: true,
+                proposal_id: [1; 32],
+                requested_amount: 100 * CKB,
+                receiver_lock_hash: [2; 32],
+                yes: 1,
+                no: 0,
+                final_state_hash: [3; 32],
+                proposal_config_data_hash: blake2b_256(&config.encode()),
+            }
+            .encode(),
+        ),
+    );
+    let build = |action: Vec<u8>| {
+        TransactionBuilder::default()
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(config_cell.clone())
+                    .build(),
+            )
+            .input(
+                CellInput::new_builder()
+                    .previous_output(treasury_input.clone())
+                    .build(),
+            )
+            .input(
+                CellInput::new_builder()
+                    .previous_output(result_input.clone())
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(1_100 * CKB)
+                    .lock(ordinary_lock.clone())
+                    .build(),
+            )
+            .output_data(Bytes::new().pack())
+            .witness(
+                WitnessArgs::new_builder()
+                    .lock(Some(Bytes::from(action)).pack())
+                    .build()
+                    .as_bytes()
+                    .pack(),
+            )
+            .build()
+    };
+    let payout = context.complete_tx(build(vec![1]));
+    context.verify_tx(&payout, 20_000_000).unwrap();
+    let burn = context.complete_tx(build(vec![0; 33]));
+    assert!(context.verify_tx(&burn, 20_000_000).is_err());
+}
+
+#[test]
 fn tally_contract_accepts_builder_generated_final_batch() {
     let mut context = Context::default();
     let tally_code = context.deploy_cell_by_name("tally-type-script");
@@ -1844,11 +1961,67 @@ fn expired_treasury_cell_can_be_burned_with_capped_incentive() {
         .lock(Some(Bytes::from(action)).pack())
         .build();
     let tx = TransactionBuilder::default()
+        .cell_dep(
+            CellDep::new_builder()
+                .out_point(config_cell.clone())
+                .build(),
+        )
+        .input(
+            CellInput::new_builder()
+                .since(0x8000_0000_0000_000cu64)
+                .previous_output(treasury_input.clone())
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(880 * CKB)
+                .lock(zero_lock.clone())
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(120 * CKB)
+                .lock(caller_lock.clone())
+                .build(),
+        )
+        .output_data(Bytes::new().pack())
+        .output_data(Bytes::new().pack())
+        .witness(witness.as_bytes().pack())
+        .build();
+    let tx = context.complete_tx(tx);
+    context.verify_tx(&tx, 20_000_000).unwrap();
+
+    let result_input = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(100 * CKB)
+            .lock(caller_lock.clone())
+            .type_(Some(result_type).pack())
+            .build(),
+        Bytes::from(
+            ResultData {
+                passed: true,
+                proposal_id: [1; 32],
+                requested_amount: 100 * CKB,
+                receiver_lock_hash: [2; 32],
+                yes: 1,
+                no: 0,
+                final_state_hash: [3; 32],
+                proposal_config_data_hash: [4; 32],
+            }
+            .encode(),
+        ),
+    );
+    let burn_with_result = TransactionBuilder::default()
         .cell_dep(CellDep::new_builder().out_point(config_cell).build())
         .input(
             CellInput::new_builder()
                 .since(0x8000_0000_0000_000cu64)
                 .previous_output(treasury_input)
+                .build(),
+        )
+        .input(
+            CellInput::new_builder()
+                .previous_output(result_input)
                 .build(),
         )
         .output(
@@ -1867,6 +2040,6 @@ fn expired_treasury_cell_can_be_burned_with_capped_incentive() {
         .output_data(Bytes::new().pack())
         .witness(witness.as_bytes().pack())
         .build();
-    let tx = context.complete_tx(tx);
-    context.verify_tx(&tx, 20_000_000).unwrap();
+    let burn_with_result = context.complete_tx(burn_with_result);
+    assert!(context.verify_tx(&burn_with_result, 20_000_000).is_err());
 }

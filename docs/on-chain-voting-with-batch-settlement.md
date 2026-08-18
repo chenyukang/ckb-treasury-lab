@@ -49,7 +49,8 @@ be consumed exactly once by the payout transaction.
   advance, challenge, and finalization all include the Proposal Config Cell and
   resolve authorized Proposal, Vote, Tally, and Candidate-lock identities from it.
 - **Result Cell**: evaluated by a versioned Policy Type Script. A passed result may
-  only be consumed in a transaction containing the configured Treasury Lock.
+  only be consumed by the configured Treasury Lock's payout action; the burn
+  action explicitly rejects Result inputs.
 - **Treasury Cell**: created by CKB consensus using one fixed Treasury Lock. It can
   be spent by a passed result or burned after expiry.
 - **Grant Cell**: optional payout lock with an absolute block timelock and a

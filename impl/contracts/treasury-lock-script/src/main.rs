@@ -73,6 +73,11 @@ fn burn(config: TreasuryConfig, recipient_lock_hash: [u8; 32]) -> Result<(), Err
     if !treasury_output_indices()?.is_empty() {
         return Err(Error::BurnOutputInvalid);
     }
+    if QueryIter::new(load_cell_type_hash, Source::Input)
+        .any(|type_hash| type_hash == Some(config.result_type_hash))
+    {
+        return Err(Error::ResultInvalid);
+    }
     let relative_blocks = QueryIter::new(load_input_since, Source::GroupInput)
         .map(|raw_since| {
             let since = Since::new(raw_since);
