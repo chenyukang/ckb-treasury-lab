@@ -887,6 +887,7 @@ mod tests {
             approval_bps: 6_000,
             minimum_total_votes: 1,
             maximum_proposal_amount: 1_000,
+            minimum_challenge_period: 5,
             treasury_lock_hash: [1; 32],
             dao_code_hash: [9; 32],
             dao_hash_type: 1,

@@ -57,6 +57,7 @@ fn tally_proposal_config(
         approval_bps: 6_000,
         minimum_total_votes: 1,
         maximum_proposal_amount: 1_000 * CKB,
+        minimum_challenge_period: 5,
         treasury_lock_hash: [7; 32],
         dao_code_hash: [8; 32],
         dao_hash_type: 1,
@@ -116,6 +117,7 @@ fn proposal_contract_uses_proposal_config_as_identity_source() {
         approval_bps: 6_000,
         minimum_total_votes: 100 * CKB as u128,
         maximum_proposal_amount: 1_000 * CKB,
+        minimum_challenge_period: 5,
         treasury_lock_hash: [7; 32],
         dao_code_hash: [8; 32],
         dao_hash_type: 1,
@@ -181,6 +183,11 @@ fn proposal_contract_uses_proposal_config_as_identity_source() {
     };
     let valid = context.complete_tx(build(config_cell.clone(), proposal.encode()));
     context.verify_tx(&valid, 20_000_000).unwrap();
+
+    proposal.challenge_period = config.minimum_challenge_period - 1;
+    let short_challenge = context.complete_tx(build(config_cell.clone(), proposal.encode()));
+    assert!(context.verify_tx(&short_challenge, 20_000_000).is_err());
+    proposal.challenge_period = config.minimum_challenge_period;
 
     let valid_config_hash = proposal.proposal_config_type_hash;
     proposal.proposal_config_type_hash = [0x99; 32];
@@ -338,6 +345,7 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
         approval_bps: 6_000,
         minimum_total_votes: 100 * CKB as u128,
         maximum_proposal_amount: 1_000 * CKB,
+        minimum_challenge_period: 5,
         treasury_lock_hash: [7; 32],
         dao_code_hash: dao_type.code_hash().as_slice().try_into().unwrap(),
         dao_hash_type: dao_type.hash_type().as_slice()[0],
@@ -552,6 +560,7 @@ fn policy_contract_rejects_proposal_bound_to_different_config() {
         approval_bps: 6_000,
         minimum_total_votes: 1,
         maximum_proposal_amount: 1_000 * CKB,
+        minimum_challenge_period: 5,
         treasury_lock_hash: [7; 32],
         dao_code_hash: [8; 32],
         dao_hash_type: 1,
@@ -1618,6 +1627,7 @@ fn treasury_payout_preserves_treasury_capacity() {
                 approval_bps: 6000,
                 minimum_total_votes: 1,
                 maximum_proposal_amount: 1_000 * CKB,
+                minimum_challenge_period: 5,
                 treasury_lock_hash: treasury_lock
                     .calc_script_hash()
                     .as_slice()

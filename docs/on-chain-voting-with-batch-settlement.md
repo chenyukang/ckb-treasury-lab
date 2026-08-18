@@ -55,9 +55,13 @@ be consumed exactly once by the payout transaction.
   beneficiary lock hash.
 - **Proposal Config Cell**: an immutable Type-ID cell and the single source for
   the canonical Nervos DAO identity, authorized Proposal, Vote, and Tally code
-  identities, exact Policy Type Script hash, passing rules, and global proposal
-  amount cap. An upgrade creates a new Proposal Config Cell; existing proposals
-  continue to reference their original configuration.
+  identities, exact Policy Type Script hash, passing rules, global proposal
+  amount cap, and the minimum challenge period. An upgrade creates a new Proposal
+  Config Cell; existing proposals continue to reference their original
+  configuration. Test and devnet configurations use five blocks; production
+  deployments should use at least 8,640 blocks (about 24 hours at a ten-second
+  block interval) unless a stronger network-specific analysis selects a longer
+  window.
 
 ## VoteRecord
 

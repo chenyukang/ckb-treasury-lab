@@ -15,7 +15,7 @@ pub const EVENT_STATE_NAMESPACE: u8 = 2;
 pub const PROPOSAL_DATA_LEN: usize = 150;
 pub const TALLY_STATE_LEN: usize = 226;
 pub const RESULT_DATA_LEN: usize = 170;
-pub const PROPOSAL_CONFIG_LEN: usize = 255;
+pub const PROPOSAL_CONFIG_LEN: usize = 263;
 pub const TREASURY_CONFIG_LEN: usize = 97;
 pub const EVENT_PRESENT: Hash = [
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -452,6 +452,7 @@ pub struct ProposalConfig {
     pub approval_bps: u16,
     pub minimum_total_votes: u128,
     pub maximum_proposal_amount: u64,
+    pub minimum_challenge_period: u64,
     pub treasury_lock_hash: Hash,
     pub dao_code_hash: Hash,
     pub dao_hash_type: u8,
@@ -476,6 +477,7 @@ impl ProposalConfig {
             approval_bps: reader.u16()?,
             minimum_total_votes: reader.u128()?,
             maximum_proposal_amount: reader.u64()?,
+            minimum_challenge_period: reader.u64()?,
             treasury_lock_hash: reader.hash()?,
             dao_code_hash: reader.hash()?,
             dao_hash_type: reader.u8()?,
@@ -493,6 +495,7 @@ impl ProposalConfig {
             || value.approval_bps > 10_000
             || value.minimum_total_votes == 0
             || value.maximum_proposal_amount == 0
+            || value.minimum_challenge_period == 0
             || value.treasury_lock_hash == [0; 32]
             || value.dao_code_hash == [0; 32]
             || value.proposal_code_hash == [0; 32]
@@ -516,6 +519,7 @@ impl ProposalConfig {
         output.extend_from_slice(&self.approval_bps.to_le_bytes());
         output.extend_from_slice(&self.minimum_total_votes.to_le_bytes());
         output.extend_from_slice(&self.maximum_proposal_amount.to_le_bytes());
+        output.extend_from_slice(&self.minimum_challenge_period.to_le_bytes());
         output.extend_from_slice(&self.treasury_lock_hash);
         output.extend_from_slice(&self.dao_code_hash);
         output.push(self.dao_hash_type);
@@ -1248,6 +1252,7 @@ mod tests {
             approval_bps: 6000,
             minimum_total_votes: 100,
             maximum_proposal_amount: 1_000,
+            minimum_challenge_period: 5,
             treasury_lock_hash: [6; 32],
             dao_code_hash: [9; 32],
             dao_hash_type: 1,
@@ -1306,6 +1311,7 @@ mod tests {
             approval_bps: 6000,
             minimum_total_votes: 0,
             maximum_proposal_amount: 1_000,
+            minimum_challenge_period: 5,
             treasury_lock_hash: [6; 32],
             dao_code_hash: [9; 32],
             dao_hash_type: 1,
@@ -1320,6 +1326,15 @@ mod tests {
         };
         assert_eq!(
             ProposalConfig::decode(&invalid_policy.encode()),
+            Err(CodecError::InvalidValue)
+        );
+        let invalid_challenge_period = ProposalConfig {
+            minimum_total_votes: 1,
+            minimum_challenge_period: 0,
+            ..invalid_policy
+        };
+        assert_eq!(
+            ProposalConfig::decode(&invalid_challenge_period.encode()),
             Err(CodecError::InvalidValue)
         );
 
@@ -1343,6 +1358,7 @@ mod tests {
             approval_bps: 6000,
             minimum_total_votes: 100,
             maximum_proposal_amount: 1_000,
+            minimum_challenge_period: 5,
             treasury_lock_hash: [9; 32],
             dao_code_hash: [8; 32],
             dao_hash_type: 1,

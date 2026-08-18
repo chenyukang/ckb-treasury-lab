@@ -30,6 +30,7 @@ enum Error {
     ConfigNotFound,
     ConfigInvalid,
     ContractIdentityMismatch,
+    ChallengePeriodTooShort,
 }
 
 pub fn program_entry() -> i8 {
@@ -66,6 +67,9 @@ fn create() -> Result<(), Error> {
         || script.hash_type().as_slice()[0] != config.proposal_hash_type
     {
         return Err(Error::ContractIdentityMismatch);
+    }
+    if proposal.challenge_period < config.minimum_challenge_period {
+        return Err(Error::ChallengePeriodTooShort);
     }
     Ok(())
 }
