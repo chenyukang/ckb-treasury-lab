@@ -1868,9 +1868,126 @@ fn treasury_payout_preserves_treasury_capacity() {
         CellOutput::new_builder()
             .capacity(100 * CKB)
             .lock(ordinary_lock)
-            .type_(Some(result_type).pack())
+            .type_(Some(result_type.clone()).pack())
             .build(),
         Bytes::from(result.encode()),
+    );
+    let witness = WitnessArgs::new_builder()
+        .lock(Some(Bytes::from(vec![1])).pack())
+        .build();
+    let build = |receiver_type: Option<Script>, receiver_data: Bytes| {
+        TransactionBuilder::default()
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(config_cell.clone())
+                    .build(),
+            )
+            .input(
+                CellInput::new_builder()
+                    .previous_output(treasury_input.clone())
+                    .build(),
+            )
+            .input(
+                CellInput::new_builder()
+                    .previous_output(result_input.clone())
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(600 * CKB)
+                    .lock(receiver_lock.clone())
+                    .type_(receiver_type.pack())
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(400 * CKB)
+                    .lock(treasury_lock.clone())
+                    .build(),
+            )
+            .output_data(receiver_data.pack())
+            .output_data(Bytes::new().pack())
+            .witness(witness.as_bytes().pack())
+            .build()
+    };
+    let tx = context.complete_tx(build(None, Bytes::new()));
+    context.verify_tx(&tx, 20_000_000).unwrap();
+    let typed_receiver = context.complete_tx(build(Some(result_type), Bytes::new()));
+    assert!(context.verify_tx(&typed_receiver, 20_000_000).is_err());
+    let data_receiver = context.complete_tx(build(None, Bytes::from(vec![1])));
+    assert!(context.verify_tx(&data_receiver, 20_000_000).is_err());
+}
+
+#[test]
+fn treasury_receiver_cannot_alias_change_output() {
+    let mut context = Context::default();
+    let treasury_code = context.deploy_cell_by_name("treasury-lock-script");
+    let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
+    let ordinary_lock = context
+        .build_script(&always_success, Bytes::from(vec![1]))
+        .unwrap();
+    let zero_lock = context
+        .build_script(&always_success, Bytes::from(vec![0]))
+        .unwrap();
+    let config_type = context
+        .build_script(&always_success, Bytes::from(vec![3]))
+        .unwrap();
+    let result_type = context
+        .build_script(&always_success, Bytes::from(vec![4]))
+        .unwrap();
+    let treasury_lock = context
+        .build_script(&treasury_code, config_type.calc_script_hash().as_bytes())
+        .unwrap();
+    let treasury_config = TreasuryConfig {
+        burn_expiry_blocks: 100,
+        base_burn_incentive: 100 * CKB,
+        burn_incentive_rate: 0,
+        maximum_burn_incentive: 100 * CKB,
+        result_type_hash: result_type
+            .calc_script_hash()
+            .as_slice()
+            .try_into()
+            .unwrap(),
+        zero_lock_hash: zero_lock.calc_script_hash().as_slice().try_into().unwrap(),
+    };
+    let config_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(ordinary_lock.clone())
+            .type_(Some(config_type).pack())
+            .build(),
+        Bytes::from(treasury_config.encode()),
+    );
+    let treasury_input = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(treasury_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+    let result_input = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(100 * CKB)
+            .lock(ordinary_lock)
+            .type_(Some(result_type).pack())
+            .build(),
+        Bytes::from(
+            ResultData {
+                passed: true,
+                proposal_id: [1; 32],
+                requested_amount: 500 * CKB,
+                receiver_lock_hash: treasury_lock
+                    .calc_script_hash()
+                    .as_slice()
+                    .try_into()
+                    .unwrap(),
+                yes: 1,
+                no: 0,
+                final_state_hash: [2; 32],
+                proposal_config_data_hash: [3; 32],
+            }
+            .encode(),
+        ),
     );
     let witness = WitnessArgs::new_builder()
         .lock(Some(Bytes::from(vec![1])).pack())
@@ -1889,22 +2006,15 @@ fn treasury_payout_preserves_treasury_capacity() {
         )
         .output(
             CellOutput::new_builder()
-                .capacity(600 * CKB)
-                .lock(receiver_lock)
-                .build(),
-        )
-        .output(
-            CellOutput::new_builder()
-                .capacity(400 * CKB)
+                .capacity(500 * CKB)
                 .lock(treasury_lock)
                 .build(),
         )
         .output_data(Bytes::new().pack())
-        .output_data(Bytes::new().pack())
         .witness(witness.as_bytes().pack())
         .build();
     let tx = context.complete_tx(tx);
-    context.verify_tx(&tx, 20_000_000).unwrap();
+    assert!(context.verify_tx(&tx, 20_000_000).is_err());
 }
 
 #[test]

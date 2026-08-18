@@ -144,6 +144,12 @@ fn payout(config: TreasuryConfig) -> Result<(), Error> {
     if load_cell_capacity(receiver_output, Source::Output)
         .map_err(|_| Error::ReceiverOutputInvalid)?
         != result.requested_amount
+        || load_cell_type(receiver_output, Source::Output)
+            .map_err(|_| Error::ReceiverOutputInvalid)?
+            .is_some()
+        || !load_cell_data(receiver_output, Source::Output)
+            .map_err(|_| Error::ReceiverOutputInvalid)?
+            .is_empty()
     {
         return Err(Error::ReceiverOutputInvalid);
     }
@@ -158,9 +164,10 @@ fn payout(config: TreasuryConfig) -> Result<(), Error> {
             return Err(Error::PayoutChangeCountInvalid);
         }
         let change_index = treasury_outputs[0];
-        if load_cell_capacity(change_index, Source::Output)
-            .map_err(|_| Error::PayoutChangeCapacityInvalid)?
-            != change
+        if change_index == receiver_output
+            || load_cell_capacity(change_index, Source::Output)
+                .map_err(|_| Error::PayoutChangeCapacityInvalid)?
+                != change
         {
             return Err(Error::PayoutChangeCapacityInvalid);
         }

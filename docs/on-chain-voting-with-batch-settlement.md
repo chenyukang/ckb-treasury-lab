@@ -244,7 +244,8 @@ For payout, the Treasury Lock requires exactly one passed Result input. If the
 Treasury inputs sum to `T` and the proposal requests `A`, the transaction must
 create:
 
-- exactly one receiver output with capacity `A`; and
+- exactly one receiver output with capacity `A`, no Type Script, and empty data;
+  this output must be distinct from Treasury change; and
 - zero or one Treasury change output with capacity `T - A`.
 
 Treasury capacity cannot pay transaction fees; external inputs fund fees.
