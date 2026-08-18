@@ -52,6 +52,7 @@ enum Error {
     ConfigInvalid,
     ContractIdentityMismatch,
     TallyLockInvalid,
+    BondTooSmall,
 }
 
 pub fn program_entry() -> i8 {
@@ -96,6 +97,10 @@ fn create() -> Result<(), Error> {
             != state.operator_lock_hash
     {
         return Err(Error::InvalidState);
+    }
+    let bond = load_cell_capacity(0, Source::GroupOutput).map_err(|_| Error::BondTooSmall)?;
+    if bond < config.minimum_tally_bond || bond < proposal.requested_amount {
+        return Err(Error::BondTooSmall);
     }
     require_operator(state.operator_lock_hash)
 }

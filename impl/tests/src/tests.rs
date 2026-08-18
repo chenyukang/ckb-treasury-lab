@@ -58,6 +58,7 @@ fn tally_proposal_config(
         minimum_total_votes: 1,
         maximum_proposal_amount: 1_000 * CKB,
         minimum_challenge_period: 5,
+        minimum_tally_bond: 1_000 * CKB,
         treasury_lock_hash: [7; 32],
         dao_code_hash: [8; 32],
         dao_hash_type: 1,
@@ -118,6 +119,7 @@ fn proposal_contract_uses_proposal_config_as_identity_source() {
         minimum_total_votes: 100 * CKB as u128,
         maximum_proposal_amount: 1_000 * CKB,
         minimum_challenge_period: 5,
+        minimum_tally_bond: 1_000 * CKB,
         treasury_lock_hash: [7; 32],
         dao_code_hash: [8; 32],
         dao_hash_type: 1,
@@ -215,6 +217,101 @@ fn proposal_contract_uses_proposal_config_as_identity_source() {
     assert_ne!(proposal.proposal_config_type_hash, valid_config_hash);
     let unauthorized = context.complete_tx(build(wrong_config_cell, proposal.encode()));
     assert!(context.verify_tx(&unauthorized, 20_000_000).is_err());
+}
+
+#[test]
+fn tally_create_enforces_configured_and_requested_bond_floors() {
+    let mut context = Context::default();
+    let tally_code = context.deploy_cell_by_name("tally-type-script");
+    let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
+    let operator_lock = context
+        .build_script(&always_success, Bytes::from(vec![1]))
+        .unwrap();
+    let candidate_lock = context
+        .build_script(&always_success, Bytes::from(vec![2]))
+        .unwrap();
+    let proposal_type = context
+        .build_script(&always_success, Bytes::from(vec![3]))
+        .unwrap();
+    let proposal_id = proposal_type
+        .calc_script_hash()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let funding_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(1_000 * CKB)
+            .lock(operator_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+    let funding_input = CellInput::new_builder()
+        .previous_output(funding_cell)
+        .build();
+    let tally_type = context
+        .build_script(
+            &tally_code,
+            Bytes::from(type_id(&funding_input, 0).to_vec()),
+        )
+        .unwrap();
+    let mut config =
+        tally_proposal_config(&proposal_type, [0x22; 32], &tally_type, &candidate_lock);
+    config.minimum_tally_bond = 500 * CKB;
+    let (config_cell, config_hash) =
+        create_proposal_config_dep(&mut context, &always_success, &operator_lock, config);
+    let mut proposal_cell = |requested_amount| {
+        let mut proposal = proposal(proposal_id, [0x22; 32]);
+        proposal.requested_amount = requested_amount;
+        proposal.proposal_config_type_hash = config_hash;
+        context.create_cell(
+            CellOutput::new_builder()
+                .capacity(1_000 * CKB)
+                .lock(operator_lock.clone())
+                .type_(Some(proposal_type.clone()).pack())
+                .build(),
+            Bytes::from(proposal.encode()),
+        )
+    };
+    let small_proposal = proposal_cell(100 * CKB);
+    let large_proposal = proposal_cell(600 * CKB);
+    let initial = TallyBuilder::new(
+        proposal_id,
+        operator_lock
+            .calc_script_hash()
+            .as_slice()
+            .try_into()
+            .unwrap(),
+        10,
+        config,
+    )
+    .state()
+    .clone();
+    let build = |proposal_cell: OutPoint, bond: u64| {
+        TransactionBuilder::default()
+            .cell_dep(CellDep::new_builder().out_point(proposal_cell).build())
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(config_cell.clone())
+                    .build(),
+            )
+            .input(funding_input.clone())
+            .output(
+                CellOutput::new_builder()
+                    .capacity(bond)
+                    .lock(operator_lock.clone())
+                    .type_(Some(tally_type.clone()).pack())
+                    .build(),
+            )
+            .output_data(Bytes::from(initial.encode()).pack())
+            .build()
+    };
+
+    let below_config = context.complete_tx(build(small_proposal.clone(), 499 * CKB));
+    assert!(context.verify_tx(&below_config, 100_000_000).is_err());
+    let configured_minimum = context.complete_tx(build(small_proposal, 500 * CKB));
+    context.verify_tx(&configured_minimum, 100_000_000).unwrap();
+    let below_requested = context.complete_tx(build(large_proposal, 599 * CKB));
+    assert!(context.verify_tx(&below_requested, 100_000_000).is_err());
 }
 
 fn historical_vote_raw(
@@ -346,6 +443,7 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
         minimum_total_votes: 100 * CKB as u128,
         maximum_proposal_amount: 1_000 * CKB,
         minimum_challenge_period: 5,
+        minimum_tally_bond: 1_000 * CKB,
         treasury_lock_hash: [7; 32],
         dao_code_hash: dao_type.code_hash().as_slice().try_into().unwrap(),
         dao_hash_type: dao_type.hash_type().as_slice()[0],
@@ -561,6 +659,7 @@ fn policy_contract_rejects_proposal_bound_to_different_config() {
         minimum_total_votes: 1,
         maximum_proposal_amount: 1_000 * CKB,
         minimum_challenge_period: 5,
+        minimum_tally_bond: 1_000 * CKB,
         treasury_lock_hash: [7; 32],
         dao_code_hash: [8; 32],
         dao_hash_type: 1,
@@ -1628,6 +1727,7 @@ fn treasury_payout_preserves_treasury_capacity() {
                 minimum_total_votes: 1,
                 maximum_proposal_amount: 1_000 * CKB,
                 minimum_challenge_period: 5,
+                minimum_tally_bond: 1_000 * CKB,
                 treasury_lock_hash: treasury_lock
                     .calc_script_hash()
                     .as_slice()

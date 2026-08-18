@@ -317,6 +317,7 @@ fn run() -> AnyResult<()> {
         minimum_total_votes: 2_000 * CKB as u128,
         maximum_proposal_amount: 1_000 * CKB,
         minimum_challenge_period: 5,
+        minimum_tally_bond: 1_000 * CKB,
         treasury_lock_hash: packed_hash(&treasury_lock.calc_script_hash()),
         dao_code_hash: packed_hash(&dao_type.code_hash()),
         dao_hash_type: TYPE_HASH_TYPE,

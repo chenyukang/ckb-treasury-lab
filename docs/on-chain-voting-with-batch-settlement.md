@@ -41,7 +41,8 @@ be consumed exactly once by the payout transaction.
   DAO-like script. A DAO outpoint cannot simultaneously be a VoteTx `cell_dep`
   and an input; both the Vote Script and tally reducer reject this.
 - **TallySession Cell**: a Type-ID singleton owned logically by one operator. Its
-  capacity is the settlement bond. Active sessions use the operator lock. Each
+  capacity is the settlement bond, which must be at least both Proposal Config's
+  absolute minimum and the Proposal's requested payout. Active sessions use the operator lock. Each
   batch consumes the previous session and creates the next state. The final
   Candidate must switch to the permissionless lock hash committed by Proposal
   Config, so a valid challenge never needs the operator's signature. Creation,
@@ -56,12 +57,12 @@ be consumed exactly once by the payout transaction.
 - **Proposal Config Cell**: an immutable Type-ID cell and the single source for
   the canonical Nervos DAO identity, authorized Proposal, Vote, and Tally code
   identities, exact Policy Type Script hash, passing rules, global proposal
-  amount cap, and the minimum challenge period. An upgrade creates a new Proposal
-  Config Cell; existing proposals continue to reference their original
-  configuration. Test and devnet configurations use five blocks; production
-  deployments should use at least 8,640 blocks (about 24 hours at a ten-second
-  block interval) unless a stronger network-specific analysis selects a longer
-  window.
+  amount cap, minimum challenge period, and minimum tally bond. An upgrade creates
+  a new Proposal Config Cell; existing proposals continue to reference their
+  original configuration. Test and devnet configurations use five blocks and a
+  1,000 CKB absolute bond floor; production deployments should use at least 8,640
+  blocks (about 24 hours at a ten-second block interval) unless a stronger
+  network-specific analysis selects a longer window.
 
 ## VoteRecord
 
