@@ -452,7 +452,6 @@ impl TallyBuilder {
 
     pub fn build_omitted_vote_challenge(
         &self,
-        challenger_lock_hash: Hash,
         omitted: ProvenTransaction,
     ) -> Result<treasury_common::TallyWitness, BuilderError> {
         let raw = RawTransaction::from_slice(&omitted.raw_transaction)
@@ -464,7 +463,6 @@ impl TallyBuilder {
         }
         let keys = BTreeSet::from([event_key]);
         Ok(treasury_common::TallyWitness::ChallengeVote {
-            challenger_lock_hash,
             omitted,
             event_proof: compiled_proof(&self.committed_state, &keys)?,
         })
@@ -472,7 +470,6 @@ impl TallyBuilder {
 
     pub fn build_omitted_spend_challenge(
         &self,
-        challenger_lock_hash: Hash,
         omitted_spend: ProvenTransaction,
         dao_out_point: OutPoint,
     ) -> Result<treasury_common::TallyWitness, BuilderError> {
@@ -496,7 +493,6 @@ impl TallyBuilder {
             return Err(BuilderError::InvalidState);
         }
         Ok(treasury_common::TallyWitness::ChallengeSpend {
-            challenger_lock_hash,
             omitted_spend,
             dao_out_point,
             voter_lock_hash,
@@ -1145,7 +1141,7 @@ mod tests {
             .unwrap();
         assert!(
             omitted_builder
-                .build_omitted_spend_challenge([6; 32], spend.clone(), dao_out_point)
+                .build_omitted_spend_challenge(spend.clone(), dao_out_point)
                 .is_ok()
         );
 
@@ -1166,7 +1162,7 @@ mod tests {
             .unwrap();
         assert!(
             complete_builder
-                .build_omitted_spend_challenge([6; 32], spend, dao_out_point)
+                .build_omitted_spend_challenge(spend, dao_out_point)
                 .is_err()
         );
     }

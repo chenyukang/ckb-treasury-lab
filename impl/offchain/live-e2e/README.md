@@ -1,6 +1,6 @@
-# V3 live-chain E2E
+# V4 live-chain E2E
 
-This runner starts an isolated Dummy-PoW CKB node and executes the current V3
+This runner starts an isolated Dummy-PoW CKB node and executes the current V4
 Treasury voting lifecycle against real RPC, tx-pool, block assembly, and block
 verification paths.
 

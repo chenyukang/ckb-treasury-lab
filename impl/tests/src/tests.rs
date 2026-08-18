@@ -1475,22 +1475,13 @@ fn omitted_vote_challenge_slashes_candidate_bond() {
         )
         .build();
     context.insert_header(omitted_header.clone());
-    let challenge = builder
-        .build_omitted_vote_challenge(
-            challenger_lock
-                .calc_script_hash()
-                .as_slice()
-                .try_into()
-                .unwrap(),
-            omitted,
-        )
-        .unwrap();
+    let challenge = builder.build_omitted_vote_challenge(omitted).unwrap();
 
     let bond = 2_000 * CKB;
     let candidate_cell = context.create_cell(
         CellOutput::new_builder()
             .capacity(bond)
-            .lock(session_lock)
+            .lock(session_lock.clone())
             .type_(Some(tally_script).pack())
             .build(),
         Bytes::from(candidate.encode()),
@@ -1498,25 +1489,37 @@ fn omitted_vote_challenge_slashes_candidate_bond() {
     let witness = WitnessArgs::new_builder()
         .input_type(Some(Bytes::from(challenge.encode().unwrap())).pack())
         .build();
-    let tx = TransactionBuilder::default()
-        .cell_dep(CellDep::new_builder().out_point(proposal_cell).build())
-        .cell_dep(CellDep::new_builder().out_point(config_cell).build())
-        .header_dep(omitted_header.hash())
-        .input(
-            CellInput::new_builder()
-                .previous_output(candidate_cell)
-                .build(),
-        )
-        .output(
-            CellOutput::new_builder()
-                .capacity(bond)
-                .lock(challenger_lock)
-                .build(),
-        )
-        .output_data(Bytes::new().pack())
-        .witness(witness.as_bytes().pack())
-        .build();
-    let tx = context.complete_tx(tx);
+    let build = |recipient_lock: Script| {
+        TransactionBuilder::default()
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(proposal_cell.clone())
+                    .build(),
+            )
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(config_cell.clone())
+                    .build(),
+            )
+            .header_dep(omitted_header.hash())
+            .input(
+                CellInput::new_builder()
+                    .previous_output(candidate_cell.clone())
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(bond)
+                    .lock(recipient_lock)
+                    .build(),
+            )
+            .output_data(Bytes::new().pack())
+            .witness(witness.as_bytes().pack())
+            .build()
+    };
+    let front_run = context.complete_tx(build(challenger_lock));
+    assert!(context.verify_tx(&front_run, 100_000_000).is_err());
+    let tx = context.complete_tx(build(session_lock));
     context.verify_tx(&tx, 100_000_000).unwrap();
 }
 
@@ -1527,9 +1530,6 @@ fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
     let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
     let session_lock = context
         .build_script(&always_success, Bytes::from(vec![1]))
-        .unwrap();
-    let challenger_lock = context
-        .build_script(&always_success, Bytes::from(vec![9]))
         .unwrap();
     let proposal_type = context
         .build_script(&always_success, Bytes::from(vec![2]))
@@ -1594,11 +1594,6 @@ fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
     context.insert_header(spend_header.clone());
     let challenge = builder
         .build_omitted_spend_challenge(
-            challenger_lock
-                .calc_script_hash()
-                .as_slice()
-                .try_into()
-                .unwrap(),
             omitted_spend,
             treasury_common::OutPoint {
                 tx_hash: [0x44; 32],
@@ -1611,7 +1606,7 @@ fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
     let candidate_cell = context.create_cell(
         CellOutput::new_builder()
             .capacity(bond)
-            .lock(session_lock)
+            .lock(session_lock.clone())
             .type_(Some(tally_script).pack())
             .build(),
         Bytes::from(candidate.encode()),
@@ -1631,7 +1626,7 @@ fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
         .output(
             CellOutput::new_builder()
                 .capacity(bond)
-                .lock(challenger_lock)
+                .lock(session_lock)
                 .build(),
         )
         .output_data(Bytes::new().pack())

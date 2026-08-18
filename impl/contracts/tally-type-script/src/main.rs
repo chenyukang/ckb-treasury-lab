@@ -144,23 +144,14 @@ fn consume() -> Result<(), Error> {
     }
     match load_tally_witness()?.0 {
         TallyWitness::ChallengeVote {
-            challenger_lock_hash,
             omitted,
             event_proof,
         } => {
             let (proposal, config) = load_proposal_dep(state.proposal_id)?;
             ensure_tally_identity(&config)?;
-            challenge_vote(
-                &state,
-                &proposal,
-                &config,
-                challenger_lock_hash,
-                &omitted,
-                &event_proof,
-            )
+            challenge_vote(&state, &proposal, &config, &omitted, &event_proof)
         }
         TallyWitness::ChallengeSpend {
-            challenger_lock_hash,
             omitted_spend,
             dao_out_point,
             voter_lock_hash,
@@ -172,7 +163,6 @@ fn consume() -> Result<(), Error> {
             ensure_in_voting_window(&omitted_spend, &proposal)?;
             challenge_spend(
                 &state,
-                challenger_lock_hash,
                 &omitted_spend,
                 dao_out_point,
                 voter_lock_hash,
@@ -434,39 +424,50 @@ fn challenge_vote(
     state: &TallyState,
     proposal: &ProposalData,
     config: &ProposalConfig,
-    challenger: Hash,
     omitted: &ProvenTransaction,
     proof: &[u8],
 ) -> Result<(), Error> {
     ensure_in_voting_window(omitted, proposal)?;
     let (raw, tx_hash) = verify_proven_transaction(omitted)?;
-    let has_vote = raw.outputs().into_iter().any(|output| {
-        output
+    let mut voter_lock_hash = None;
+    for output in raw.outputs() {
+        if output
             .type_()
             .to_opt()
             .is_some_and(|script| is_vote_script(&script, config, state.proposal_id))
-    });
+            && voter_lock_hash
+                .replace(
+                    output
+                        .lock()
+                        .calc_script_hash()
+                        .as_slice()
+                        .try_into()
+                        .unwrap(),
+                )
+                .is_some()
+        {
+            return Err(Error::ChallengeInvalid);
+        }
+    }
+    let voter_lock_hash = voter_lock_hash.ok_or(Error::ChallengeInvalid)?;
     let root = unified_root(state).ok_or(Error::InvalidState)?;
-    if !has_vote
-        || !verify_smt_transition(
-            root,
-            root,
-            proof,
-            &[LeafTransition {
-                key: state_key(EVENT_STATE_NAMESPACE, tx_hash),
-                old_value: ZERO,
-                new_value: ZERO,
-            }],
-        )
-    {
+    if !verify_smt_transition(
+        root,
+        root,
+        proof,
+        &[LeafTransition {
+            key: state_key(EVENT_STATE_NAMESPACE, tx_hash),
+            old_value: ZERO,
+            new_value: ZERO,
+        }],
+    ) {
         return Err(Error::ChallengeInvalid);
     }
-    pay_bond(challenger)
+    pay_bond(voter_lock_hash)
 }
 
 fn challenge_spend(
     state: &TallyState,
-    challenger: Hash,
     omitted_spend: &ProvenTransaction,
     dao_out_point: OutPoint,
     voter_lock_hash: Hash,
@@ -505,7 +506,7 @@ fn challenge_spend(
     {
         return Err(Error::ChallengeInvalid);
     }
-    pay_bond(challenger)
+    pay_bond(voter_lock_hash)
 }
 
 fn finalize(state: &TallyState, proposal: &ProposalData) -> Result<(), Error> {

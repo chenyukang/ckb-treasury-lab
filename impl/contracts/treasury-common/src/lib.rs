@@ -8,7 +8,7 @@ use merkle_cbt::{MerkleProof, merkle_tree::Merge};
 use sparse_merkle_tree::{CompiledMerkleProof, H256, blake2b::Blake2bHasher};
 
 pub const VERSION: u8 = 1;
-pub const TALLY_WITNESS_VERSION: u8 = 3;
+pub const TALLY_WITNESS_VERSION: u8 = 4;
 pub const VOTE_STATE_NAMESPACE: u8 = 0;
 pub const DAO_STATE_NAMESPACE: u8 = 1;
 pub const EVENT_STATE_NAMESPACE: u8 = 2;
@@ -842,12 +842,10 @@ impl BatchWitness {
 pub enum TallyWitness {
     Advance(BatchWitness),
     ChallengeVote {
-        challenger_lock_hash: Hash,
         omitted: ProvenTransaction,
         event_proof: Vec<u8>,
     },
     ChallengeSpend {
-        challenger_lock_hash: Hash,
         omitted_spend: ProvenTransaction,
         dao_out_point: OutPoint,
         voter_lock_hash: Hash,
@@ -864,12 +862,10 @@ impl TallyWitness {
         let witness = match reader.u8()? {
             TALLY_ACTION_ADVANCE => Self::Advance(BatchWitness::decode(&mut reader)?),
             TALLY_ACTION_CHALLENGE_VOTE => Self::ChallengeVote {
-                challenger_lock_hash: reader.hash()?,
                 omitted: ProvenTransaction::decode(&mut reader)?,
                 event_proof: reader.length_prefixed_bytes()?,
             },
             TALLY_ACTION_CHALLENGE_SPEND => Self::ChallengeSpend {
-                challenger_lock_hash: reader.hash()?,
                 omitted_spend: ProvenTransaction::decode(&mut reader)?,
                 dao_out_point: OutPoint::decode(&mut reader)?,
                 voter_lock_hash: reader.hash()?,
@@ -892,17 +888,14 @@ impl TallyWitness {
         match self {
             Self::Advance(_) => unreachable!(),
             Self::ChallengeVote {
-                challenger_lock_hash,
                 omitted,
                 event_proof,
             } => {
                 output.push(TALLY_ACTION_CHALLENGE_VOTE);
-                output.extend_from_slice(challenger_lock_hash);
                 omitted.encode_into(&mut output)?;
                 encode_length_prefixed(event_proof, &mut output)?;
             }
             Self::ChallengeSpend {
-                challenger_lock_hash,
                 omitted_spend,
                 dao_out_point,
                 voter_lock_hash,
@@ -910,7 +903,6 @@ impl TallyWitness {
                 dao_proof,
             } => {
                 output.push(TALLY_ACTION_CHALLENGE_SPEND);
-                output.extend_from_slice(challenger_lock_hash);
                 omitted_spend.encode_into(&mut output)?;
                 dao_out_point.encode_into(&mut output);
                 output.extend_from_slice(voter_lock_hash);
@@ -1511,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn tally_witness_uses_explicit_v3_encoding() {
+    fn tally_witness_uses_explicit_v4_encoding() {
         let encoded = TallyWitness::Finalize.encode().unwrap();
         assert_eq!(encoded[0], TALLY_WITNESS_VERSION);
         assert_eq!(TallyWitness::decode(&encoded), Ok(TallyWitness::Finalize));

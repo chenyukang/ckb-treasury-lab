@@ -39,7 +39,7 @@ proof representation and deterministic implementation:
   copy of block metadata;
 - vote, DAO-outpoint, and processed-event leaves use BLAKE2b domain-separated
   namespaces in one SMT, verified once against both the old and new roots;
-- the tally witness has an explicit V3 version, so older encodings are rejected.
+- the tally witness has an explicit V4 version, so older encodings are rejected.
 
 | Independent votes | CKB-VM cycles | Cycles per vote | Batch witness | Settlement tx |
 |---:|---:|---:|---:|---:|

@@ -375,7 +375,7 @@ fn run() -> AnyResult<()> {
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
     let mut rpc = Rpc::new(&endpoint)?;
     rpc.wait_ready()?;
-    println!("V3 live-chain E2E");
+    println!("V4 live-chain E2E");
     println!("  chain directory             {}", run_dir.display());
     println!("  RPC                         {endpoint}");
 
@@ -408,7 +408,6 @@ fn run() -> AnyResult<()> {
     let voter1_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x11]);
     let voter2_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x12]);
     let operator_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x21]);
-    let challenger_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x22]);
     let receiver_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x31]);
 
     let proposal_funding = find_cell(&cells, &proposer_lock, 1_500 * CKB)?;
@@ -652,10 +651,7 @@ fn run() -> AnyResult<()> {
     )
     .map_err(|error| other(format!("build omitted vote proof: {error:?}")))?;
     let challenge_witness = map_builder(
-        omitted_builder.build_omitted_vote_challenge(
-            packed_hash(&challenger_lock.calc_script_hash()),
-            omitted_proof,
-        ),
+        omitted_builder.build_omitted_vote_challenge(omitted_proof),
         "build omitted-vote challenge",
     )?;
     let challenge_tx = transaction(
@@ -669,7 +665,7 @@ fn run() -> AnyResult<()> {
         vec![omitted_vote_block.block_hash],
         vec![output(
             capacity(&omitted_candidate_cell.output),
-            &challenger_lock,
+            &voter2_lock,
             None,
         )],
         vec![Bytes::new()],
@@ -891,7 +887,7 @@ fn run() -> AnyResult<()> {
     let report_path = run_dir.join("report.json");
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("  report                      {}", report_path.display());
-    println!("V3 live-chain E2E PASSED");
+    println!("V4 live-chain E2E PASSED");
     Ok(())
 }
 
@@ -940,7 +936,7 @@ fn write_chain_spec(
          uncles_hash = \"0x0000000000000000000000000000000000000000000000000000000000000000\"\n\
          nonce = \"0x0\"\n\n\
          [genesis.genesis_cell]\n\
-         message = \"CKB Treasury V3 live E2E\"\n\n\
+         message = \"CKB Treasury V4 live E2E\"\n\n\
          [genesis.genesis_cell.lock]\n\
          code_hash = \"0xb35557e7e9854206f7bc13e3c3a7fa4cf8892c84a09237fb0aab40aab3771eee\"\n\
          args = \"0x\"\n\

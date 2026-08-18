@@ -2,7 +2,7 @@
 
 ## Status
 
-This document describes the V3 tally-witness implementation in `impl/`. Voting transactions,
+This document describes the V4 tally-witness implementation in `impl/`. Voting transactions,
 batch verification, challenges, passing-policy evaluation, treasury payout, burn,
 and grant timelocks execute in CKB-VM. The CKB node does not maintain a tally
 index and does not scan historical voting windows during transaction validation.
@@ -17,7 +17,7 @@ flowchart LR
     S --> B1["Batch 1: block CBMT multiproofs + SMT transition"]
     B1 --> BN["Batch N: consume prior session"]
     BN --> F["FinalCandidate"]
-    F -->|"valid omission proof"| X["Candidate removed; bond to challenger"]
+    F -->|"valid omission proof"| X["Candidate removed; bond to omitted voter"]
     F -->|"challenge period expires"| R["Passed or Failed Result Cell"]
     R -->|"passed"| T["Treasury payout"]
     R -->|"failed"| Z["No treasury access"]
@@ -104,7 +104,7 @@ Each TallySession commits to one domain-separated SMT with three logical namespa
 - event: historical transaction hash to `EVENT_PRESENT`.
 
 The current fixed-length `TallyState` layout retains the `votes_root`, `dao_root`,
-and `events_root` fields, but V3 requires all three fields to contain the same
+and `events_root` fields, but V4 requires all three fields to contain the same
 unified state root. A transition or candidate with unequal roots is invalid. This
 keeps the state layout stable while reducing each non-empty batch to one compiled
 SMT proof verified against both the old and new roots.
@@ -201,7 +201,7 @@ the operator submitted every relevant event. Intermediate batches therefore do
 not wait for a challenge period. The complete event namespace is challenged only
 after the final cursor is reached.
 
-Two V3 challenges are supported:
+Two V4 challenges are supported:
 
 - **Omitted vote**: prove a VoteTx is included in the voting window and prove its
   transaction hash is absent from the event namespace.
@@ -212,8 +212,10 @@ Two V3 challenges are supported:
   superseded vote from producing a false challenge.
 
 A successful challenge consumes the candidate and pays its entire bond to the
-challenger. It does not rewrite history. Another operator can start a fresh
-session from the Closed Proposal.
+voter lock hash authenticated by the omission proof. The recipient is not a
+witness parameter, so a mempool observer can relay or copy the proof but cannot
+redirect the reward. The challenge does not rewrite history. Another operator
+can start a fresh session from the Closed Proposal.
 
 ## Passing policy
 
