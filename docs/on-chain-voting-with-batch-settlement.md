@@ -41,10 +41,12 @@ be consumed exactly once by the payout transaction.
   DAO-like script. A DAO outpoint cannot simultaneously be a VoteTx `cell_dep`
   and an input; both the Vote Script and tally reducer reject this.
 - **TallySession Cell**: a Type-ID singleton owned logically by one operator. Its
-  capacity is the settlement bond. Each batch consumes the previous session and
-  creates the next state. Creation, advance, challenge, and finalization all
-  include the Proposal Config Cell and resolve authorized Proposal, Vote, and
-  Tally identities from it.
+  capacity is the settlement bond. Active sessions use the operator lock. Each
+  batch consumes the previous session and creates the next state. The final
+  Candidate must switch to the permissionless lock hash committed by Proposal
+  Config, so a valid challenge never needs the operator's signature. Creation,
+  advance, challenge, and finalization all include the Proposal Config Cell and
+  resolve authorized Proposal, Vote, Tally, and Candidate-lock identities from it.
 - **Result Cell**: evaluated by a versioned Policy Type Script. A passed result may
   only be consumed in a transaction containing the configured Treasury Lock.
 - **Treasury Cell**: created by CKB consensus using one fixed Treasury Lock. It can
@@ -114,9 +116,11 @@ stateDiagram-v2
 ```
 
 Only a transaction containing an input with the operator lock hash may advance or
-finalize the session. A challenge is permissionless. Competing operators may
-create independent sessions, but only one can consume the singleton Closed
-Proposal during finalization.
+finalize the session. Active batches preserve their lock, while the final batch
+must use Proposal Config's canonical permissionless Candidate lock. A challenge
+is therefore permissionless at both the lock and type-script layers. Competing
+operators may create independent sessions, but only one can consume the singleton
+Closed Proposal during finalization.
 
 ## Batch witness verification
 

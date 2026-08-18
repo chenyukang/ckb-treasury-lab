@@ -51,6 +51,7 @@ fn tally_proposal_config(
     proposal_type: &Script,
     vote_code_hash: [u8; 32],
     tally_type: &Script,
+    candidate_lock: &Script,
 ) -> ProposalConfig {
     ProposalConfig {
         approval_bps: 6_000,
@@ -65,6 +66,11 @@ fn tally_proposal_config(
         vote_hash_type: 1,
         tally_code_hash: tally_type.code_hash().as_slice().try_into().unwrap(),
         tally_hash_type: tally_type.hash_type().as_slice()[0],
+        candidate_lock_hash: candidate_lock
+            .calc_script_hash()
+            .as_slice()
+            .try_into()
+            .unwrap(),
         policy_type_hash: [9; 32],
     }
 }
@@ -119,6 +125,7 @@ fn proposal_contract_uses_proposal_config_as_identity_source() {
         vote_hash_type: 1,
         tally_code_hash: [3; 32],
         tally_hash_type: 2,
+        candidate_lock_hash: [14; 32],
         policy_type_hash: [4; 32],
     };
     let config_cell = context.create_cell(
@@ -340,6 +347,7 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
         vote_hash_type: vote_type.hash_type().as_slice()[0],
         tally_code_hash: [3; 32],
         tally_hash_type: 1,
+        candidate_lock_hash: [14; 32],
         policy_type_hash: [4; 32],
     };
     let config_cell = context.create_cell(
@@ -553,6 +561,7 @@ fn policy_contract_rejects_proposal_bound_to_different_config() {
         vote_hash_type: 1,
         tally_code_hash: tally_type.code_hash().as_slice().try_into().unwrap(),
         tally_hash_type: tally_type.hash_type().as_slice()[0],
+        candidate_lock_hash: [14; 32],
         policy_type_hash: policy_type
             .calc_script_hash()
             .as_slice()
@@ -673,6 +682,9 @@ fn tally_contract_accepts_builder_generated_final_batch() {
     let session_lock = context
         .build_script(&always_success, Bytes::from(vec![1]))
         .unwrap();
+    let candidate_lock = context
+        .build_script(&always_success, Bytes::from(vec![0xca]))
+        .unwrap();
     let proposal_type = context
         .build_script(&always_success, Bytes::from(vec![2]))
         .unwrap();
@@ -685,7 +697,12 @@ fn tally_contract_accepts_builder_generated_final_batch() {
     let tally_script = context
         .build_script(&tally_code, Bytes::from(vec![0x77; 32]))
         .unwrap();
-    let config = tally_proposal_config(&proposal_type, vote_code_hash, &tally_script);
+    let config = tally_proposal_config(
+        &proposal_type,
+        vote_code_hash,
+        &tally_script,
+        &candidate_lock,
+    );
     let (config_cell, config_hash) =
         create_proposal_config_dep(&mut context, &always_success, &session_lock, config);
     let mut proposal = proposal(proposal_id, vote_code_hash);
@@ -752,27 +769,40 @@ fn tally_contract_accepts_builder_generated_final_batch() {
     let witness = WitnessArgs::new_builder()
         .input_type(Some(Bytes::from(TallyWitness::Advance(batch).encode().unwrap())).pack())
         .build();
-    let tx = TransactionBuilder::default()
-        .cell_dep(CellDep::new_builder().out_point(proposal_cell).build())
-        .cell_dep(CellDep::new_builder().out_point(config_cell).build())
-        .header_dep(historical_header.hash())
-        .header_dep(anchor_header.hash())
-        .input(
-            CellInput::new_builder()
-                .previous_output(tally_input)
-                .build(),
-        )
-        .output(
-            CellOutput::new_builder()
-                .capacity(2_000 * CKB)
-                .lock(session_lock)
-                .type_(Some(tally_script).pack())
-                .build(),
-        )
-        .output_data(Bytes::from(output_state.encode()).pack())
-        .witness(witness.as_bytes().pack())
-        .build();
-    let tx = context.complete_tx(tx);
+    let build = |output_lock: Script| {
+        TransactionBuilder::default()
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(proposal_cell.clone())
+                    .build(),
+            )
+            .cell_dep(
+                CellDep::new_builder()
+                    .out_point(config_cell.clone())
+                    .build(),
+            )
+            .header_dep(historical_header.hash())
+            .header_dep(anchor_header.hash())
+            .input(
+                CellInput::new_builder()
+                    .previous_output(tally_input.clone())
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(2_000 * CKB)
+                    .lock(output_lock)
+                    .type_(Some(tally_script.clone()).pack())
+                    .build(),
+            )
+            .output_data(Bytes::from(output_state.encode()).pack())
+            .witness(witness.as_bytes().pack())
+            .build()
+    };
+    let wrong_lock = context.complete_tx(build(session_lock));
+    assert!(context.verify_tx(&wrong_lock, 100_000_000).is_err());
+
+    let tx = context.complete_tx(build(candidate_lock));
     let cycles = context.verify_tx(&tx, 100_000_000).unwrap();
     assert!(cycles > 0);
 }
@@ -800,7 +830,8 @@ fn build_tally_batch_tx(
     let tally_script = context
         .build_script(&tally_code, Bytes::from(vec![0x7a; 32]))
         .unwrap();
-    let config = tally_proposal_config(&proposal_type, vote_code_hash, &tally_script);
+    let config =
+        tally_proposal_config(&proposal_type, vote_code_hash, &tally_script, &session_lock);
     let (config_cell, config_hash) =
         create_proposal_config_dep(&mut context, &always_success, &session_lock, config);
     let mut proposal = proposal(proposal_id, vote_code_hash);
@@ -1056,7 +1087,8 @@ fn tally_contract_accepts_empty_final_batch() {
     let tally_script = context
         .build_script(&tally_code, Bytes::from(vec![0x78; 32]))
         .unwrap();
-    let config = tally_proposal_config(&proposal_type, vote_code_hash, &tally_script);
+    let config =
+        tally_proposal_config(&proposal_type, vote_code_hash, &tally_script, &session_lock);
     let (config_cell, config_hash) =
         create_proposal_config_dep(&mut context, &always_success, &session_lock, config);
     let mut proposal = proposal(proposal_id, vote_code_hash);
@@ -1154,7 +1186,8 @@ fn omitted_vote_challenge_slashes_candidate_bond() {
     let tally_script = context
         .build_script(&tally_code, Bytes::from(vec![0x77; 32]))
         .unwrap();
-    let config = tally_proposal_config(&proposal_type, vote_code_hash, &tally_script);
+    let config =
+        tally_proposal_config(&proposal_type, vote_code_hash, &tally_script, &session_lock);
     let (config_cell, config_hash) =
         create_proposal_config_dep(&mut context, &always_success, &session_lock, config);
     let mut proposal = proposal(proposal_id, vote_code_hash);
@@ -1285,7 +1318,8 @@ fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
     let tally_script = context
         .build_script(&tally_code, Bytes::from(vec![0x79; 32]))
         .unwrap();
-    let config = tally_proposal_config(&proposal_type, vote_code_hash, &tally_script);
+    let config =
+        tally_proposal_config(&proposal_type, vote_code_hash, &tally_script, &session_lock);
     let (config_cell, config_hash) =
         create_proposal_config_dep(&mut context, &always_success, &session_lock, config);
     let mut proposal = proposal(proposal_id, vote_code_hash);
@@ -1482,6 +1516,7 @@ fn treasury_payout_preserves_treasury_capacity() {
                 vote_hash_type: 1,
                 tally_code_hash: [12; 32],
                 tally_hash_type: 1,
+                candidate_lock_hash: [14; 32],
                 policy_type_hash: [13; 32],
             }
             .encode(),

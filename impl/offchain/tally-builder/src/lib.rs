@@ -896,6 +896,7 @@ mod tests {
             vote_hash_type: 1,
             tally_code_hash: [3; 32],
             tally_hash_type: 1,
+            candidate_lock_hash: [5; 32],
             policy_type_hash: [4; 32],
         }
     }

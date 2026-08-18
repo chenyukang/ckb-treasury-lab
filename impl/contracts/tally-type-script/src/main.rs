@@ -50,6 +50,7 @@ enum Error {
     ConfigNotFound,
     ConfigInvalid,
     ContractIdentityMismatch,
+    TallyLockInvalid,
 }
 
 pub fn program_entry() -> i8 {
@@ -90,6 +91,8 @@ fn create() -> Result<(), Error> {
         || state.no != 0
         || state.processed_events != 0
         || state.candidate_since != 0
+        || load_cell_lock_hash(0, Source::GroupOutput).map_err(|_| Error::TallyLockInvalid)?
+            != state.operator_lock_hash
     {
         return Err(Error::InvalidState);
     }
@@ -211,6 +214,16 @@ fn verify_batch(
     } else {
         TallyPhase::Active
     };
+    let input_lock_hash =
+        load_cell_lock_hash(0, Source::GroupInput).map_err(|_| Error::TallyLockInvalid)?;
+    let output_lock_hash =
+        load_cell_lock_hash(0, Source::GroupOutput).map_err(|_| Error::TallyLockInvalid)?;
+    if (expected_phase == TallyPhase::Active && output_lock_hash != input_lock_hash)
+        || (expected_phase == TallyPhase::Candidate
+            && output_lock_hash != config.candidate_lock_hash)
+    {
+        return Err(Error::TallyLockInvalid);
+    }
     if output.next_block != batch.end_block
         || output.next_tx_index != batch.end_tx_index
         || output.phase != expected_phase

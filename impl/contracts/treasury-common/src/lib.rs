@@ -15,7 +15,7 @@ pub const EVENT_STATE_NAMESPACE: u8 = 2;
 pub const PROPOSAL_DATA_LEN: usize = 150;
 pub const TALLY_STATE_LEN: usize = 226;
 pub const RESULT_DATA_LEN: usize = 170;
-pub const PROPOSAL_CONFIG_LEN: usize = 223;
+pub const PROPOSAL_CONFIG_LEN: usize = 255;
 pub const TREASURY_CONFIG_LEN: usize = 97;
 pub const EVENT_PRESENT: Hash = [
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -461,6 +461,7 @@ pub struct ProposalConfig {
     pub vote_hash_type: u8,
     pub tally_code_hash: Hash,
     pub tally_hash_type: u8,
+    pub candidate_lock_hash: Hash,
     pub policy_type_hash: Hash,
 }
 
@@ -484,6 +485,7 @@ impl ProposalConfig {
             vote_hash_type: reader.u8()?,
             tally_code_hash: reader.hash()?,
             tally_hash_type: reader.u8()?,
+            candidate_lock_hash: reader.hash()?,
             policy_type_hash: reader.hash()?,
         };
         reader.finish()?;
@@ -496,6 +498,7 @@ impl ProposalConfig {
             || value.proposal_code_hash == [0; 32]
             || value.vote_code_hash == [0; 32]
             || value.tally_code_hash == [0; 32]
+            || value.candidate_lock_hash == [0; 32]
             || value.policy_type_hash == [0; 32]
             || !is_valid_script_hash_type(value.dao_hash_type)
             || !is_valid_script_hash_type(value.proposal_hash_type)
@@ -522,6 +525,7 @@ impl ProposalConfig {
         output.push(self.vote_hash_type);
         output.extend_from_slice(&self.tally_code_hash);
         output.push(self.tally_hash_type);
+        output.extend_from_slice(&self.candidate_lock_hash);
         output.extend_from_slice(&self.policy_type_hash);
         output
     }
@@ -1253,6 +1257,7 @@ mod tests {
             vote_hash_type: 1,
             tally_code_hash: [12; 32],
             tally_hash_type: 1,
+            candidate_lock_hash: [14; 32],
             policy_type_hash: [13; 32],
         };
         assert_eq!(policy.encode().len(), PROPOSAL_CONFIG_LEN);
@@ -1310,6 +1315,7 @@ mod tests {
             vote_hash_type: 1,
             tally_code_hash: [12; 32],
             tally_hash_type: 1,
+            candidate_lock_hash: [14; 32],
             policy_type_hash: [13; 32],
         };
         assert_eq!(
@@ -1346,6 +1352,7 @@ mod tests {
             vote_hash_type: 1,
             tally_code_hash: [12; 32],
             tally_hash_type: 1,
+            candidate_lock_hash: [14; 32],
             policy_type_hash: [13; 32],
         };
         assert!(policy.passes(60, 40, 1_000));

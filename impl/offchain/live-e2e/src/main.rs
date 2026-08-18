@@ -311,6 +311,7 @@ fn run() -> AnyResult<()> {
         &packed_hash(&treasury_config_type.calc_script_hash()),
     );
     let zero_lock = script(always_code_hash, DATA_HASH_TYPE, &[0]);
+    let candidate_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x22]);
     let proposal_config = ProposalConfig {
         approval_bps: 6_000,
         minimum_total_votes: 2_000 * CKB as u128,
@@ -324,6 +325,7 @@ fn run() -> AnyResult<()> {
         vote_hash_type: DATA1_HASH_TYPE,
         tally_code_hash: *code_hashes.get("tally").unwrap(),
         tally_hash_type: DATA1_HASH_TYPE,
+        candidate_lock_hash: packed_hash(&candidate_lock.calc_script_hash()),
         policy_type_hash: packed_hash(&policy_script.calc_script_hash()),
     };
     let treasury_config = TreasuryConfig {
@@ -619,7 +621,7 @@ fn run() -> AnyResult<()> {
         &closed_proposal_cell,
         &proposal_config_cell,
         &omitted_tally_cell,
-        &operator_lock,
+        &candidate_lock,
         &omitted_tally_type,
         omitted_candidate.encode(),
         omitted_headers,
@@ -630,7 +632,7 @@ fn run() -> AnyResult<()> {
         &omitted_candidate_commit,
         0,
         capacity(&omitted_tally_cell.output),
-        &operator_lock,
+        &candidate_lock,
         Some(&omitted_tally_type),
         omitted_candidate.encode(),
     );
@@ -718,7 +720,7 @@ fn run() -> AnyResult<()> {
         &closed_proposal_cell,
         &proposal_config_cell,
         &complete_tally_cell,
-        &operator_lock,
+        &candidate_lock,
         &complete_tally_type,
         complete_candidate.encode(),
         scanned.header_deps,
@@ -729,7 +731,7 @@ fn run() -> AnyResult<()> {
         &complete_candidate_commit,
         0,
         capacity(&complete_tally_cell.output),
-        &operator_lock,
+        &candidate_lock,
         Some(&complete_tally_type),
         complete_candidate.encode(),
     );
@@ -1369,7 +1371,7 @@ fn tally_advance_tx(
     proposal: &CellRef,
     proposal_config: &CellRef,
     tally: &CellRef,
-    operator_lock: &packed::Script,
+    output_lock: &packed::Script,
     tally_type: &packed::Script,
     output_data: Vec<u8>,
     header_deps: Vec<Hash>,
@@ -1386,7 +1388,7 @@ fn tally_advance_tx(
         header_deps,
         vec![output(
             capacity(&tally.output),
-            operator_lock,
+            output_lock,
             Some(tally_type.clone()),
         )],
         vec![Bytes::from(output_data)],
