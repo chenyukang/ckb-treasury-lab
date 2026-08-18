@@ -56,3 +56,20 @@ These scripts should be implemented in Rust using [ckb-std](https://github.com/n
 When using syscalls, prefer the `high_level` API. If a high-level equivalent is unavailable, fall back to the low-level syscalls.
 Review the relevant [RFCs](https://github.com/nervosnetwork/rfcs/tree/master/rfcs) before starting implementation.
 
+### Target and memory
+
+- Contract crates are `no_std` RISC-V programs targeting `riscv64imac-unknown-none-elf`; test and off-chain crates use the native target and `std`.
+- CKB-VM provides 4 MiB of memory. Prefer `ckb_std::default_alloc!` and the default linker layout; change heap sizing or linker configuration only with measured justification.
+- Keep the pinned root toolchain. If C code is required, use Clang 17 or newer.
+
+### Transaction data and dependencies
+
+- Use packed transaction types exposed by `ckb-std::ckb_types` or `ckb-gen-types` instead of parsing Molecule structures by hand. Transaction layout is defined by [RFC 0022](https://github.com/nervosnetwork/rfcs/blob/master/rfcs/0022-transaction-structure/0022-transaction-structure.md).
+- Generated Molecule code should be committed and excluded from Clippy linting. Do not introduce a `build.rs` generator unless explicitly requested.
+- Contract dependencies must support `no_std`. Disable their default features and enable only required contract features; keep `ckb-gen-types` default features disabled.
+- Do not enable `ckb-std`'s `native-simulator` feature unless the task explicitly calls for simulator or coverage work.
+
+### Binary size and tests
+
+- Compare stripped contract sizes before and after dependency or code changes with `cd impl && make size`. Report increases above 100 KiB and warn when any final ELF exceeds 400 KiB; CKB's executable limit is roughly 500 KiB.
+- Use `ckb-testtool` and `Context::verify_tx` for contract tests. Add failure cases for changed validation paths and avoid `verify_and_dump_failed_tx` unless transaction dumps are explicitly needed.

@@ -148,6 +148,20 @@ CHECKSUM_FILE := build/checksums-$(MODE).txt
 checksum: build
 	shasum -a 256 build/$(MODE)/* > $(CHECKSUM_FILE)
 
+# Report deployed ELF sizes. Debug copies are excluded because only stripped
+# binaries are constrained by CKB's roughly 500 KiB executable size limit.
+size: build
+	@for binary in $(filter-out %.debug,$(wildcard $(BUILD_DIR)/*)); do \
+		bytes=$$(wc -c < "$$binary" | tr -d ' '); \
+		status=""; \
+		if [ "$$bytes" -gt 409600 ]; then \
+			status=" WARNING: exceeds 400 KiB"; \
+		elif [ "$$bytes" -gt 102400 ]; then \
+			status=" notice: exceeds 100 KiB"; \
+		fi; \
+		printf '%-32s %8s bytes%s\n' "$$(basename "$$binary")" "$$bytes" "$$status"; \
+	done
+
 # ============================================================================
 # Coverage targets (using native-simulator mode)
 # ============================================================================
@@ -282,5 +296,5 @@ coverage-install:
 coverage-clean:
 	rm -rf $(COVERAGE_DIR)
 
-.PHONY: build test check fmt fmt-check cargo clean prepare checksum \
+.PHONY: build test check fmt fmt-check cargo clean prepare checksum size \
         build-sim build-sim-cov coverage-run-tests coverage coverage-html coverage-lcov coverage-install coverage-clean
