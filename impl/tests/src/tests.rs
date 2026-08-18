@@ -294,7 +294,7 @@ fn historical_unique_vote_raw(
 }
 
 #[test]
-fn vote_contract_uses_proposal_configured_dao_type() {
+fn vote_contract_validates_configured_dao_type_and_amount() {
     let mut context = Context::default();
     let vote_code = context.deploy_cell_by_name("vote-type-script");
     let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
@@ -410,6 +410,42 @@ fn vote_contract_uses_proposal_configured_dao_type() {
         .build();
     let tx = context.complete_tx(tx);
     context.verify_tx(&tx, 20_000_000).unwrap();
+
+    let wrong_amount_vote_data = VoteData {
+        direction: 1,
+        amount: dao_capacity - CKB,
+        dao_dep_indices: vec![2],
+    }
+    .encode()
+    .unwrap();
+    let wrong_amount = TransactionBuilder::default()
+        .cell_dep(
+            CellDep::new_builder()
+                .out_point(proposal_cell.clone())
+                .build(),
+        )
+        .cell_dep(
+            CellDep::new_builder()
+                .out_point(config_cell.clone())
+                .build(),
+        )
+        .cell_dep(CellDep::new_builder().out_point(dao_cell.clone()).build())
+        .input(
+            CellInput::new_builder()
+                .previous_output(owner_input.clone())
+                .build(),
+        )
+        .output(
+            CellOutput::new_builder()
+                .capacity(500 * CKB)
+                .lock(owner_lock.clone())
+                .type_(Some(vote_type.clone()).pack())
+                .build(),
+        )
+        .output_data(Bytes::from(wrong_amount_vote_data).pack())
+        .build();
+    let wrong_amount = context.complete_tx(wrong_amount);
+    assert!(context.verify_tx(&wrong_amount, 20_000_000).is_err());
 
     let forged_dao_type = Script::new_builder()
         .code_hash(Byte32::from_slice(&[0x99; 32]).unwrap())
@@ -744,7 +780,7 @@ fn tally_contract_accepts_builder_generated_final_batch() {
 fn build_tally_batch_tx(
     vote_count: usize,
     include_fillers: bool,
-    mutate_batch: impl FnOnce(&mut BatchWitness),
+    mutate: impl FnOnce(&mut TallyState, &mut BatchWitness),
 ) -> (Context, TransactionView, usize, usize) {
     let mut context = Context::default();
     let tally_code = context.deploy_cell_by_name("tally-type-script");
@@ -858,7 +894,7 @@ fn build_tally_batch_tx(
         config,
     );
     let input_state = builder.state().clone();
-    let (output_state, mut batch) = builder
+    let (mut output_state, mut batch) = builder
         .build_batch(
             &proposal,
             blocks,
@@ -867,7 +903,7 @@ fn build_tally_batch_tx(
             proposal.end_block,
         )
         .unwrap();
-    mutate_batch(&mut batch);
+    mutate(&mut output_state, &mut batch);
 
     let tally_input = context.create_cell(
         CellOutput::new_builder()
@@ -909,7 +945,7 @@ fn build_tally_batch_tx(
 
 fn benchmark_tally_batch(vote_count: usize) -> (u64, usize, usize) {
     let (context, tx, batch_witness_bytes, transaction_bytes) =
-        build_tally_batch_tx(vote_count, false, |_| {});
+        build_tally_batch_tx(vote_count, false, |_, _| {});
     let cycles = context.verify_tx(&tx, 3_500_000_000).unwrap();
     (cycles, batch_witness_bytes, transaction_bytes)
 }
@@ -928,33 +964,33 @@ fn benchmark_tally_batch_cycles() {
 
 #[test]
 fn tally_contract_rejects_malformed_block_multiproofs() {
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, |batch| {
+    let (context, tx, _, _) = build_tally_batch_tx(2, false, |_, batch| {
         batch.blocks[0].transactions[1].tx_index = batch.blocks[0].transactions[0].tx_index;
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, |batch| {
+    let (context, tx, _, _) = build_tally_batch_tx(2, false, |_, batch| {
         batch.blocks[0].transactions.swap(0, 1);
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, |batch| {
+    let (context, tx, _, _) = build_tally_batch_tx(2, false, |_, batch| {
         batch.blocks[0].lemmas.push([0x55; 32]);
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, true, |batch| {
+    let (context, tx, _, _) = build_tally_batch_tx(2, true, |_, batch| {
         assert!(!batch.blocks[0].lemmas.is_empty());
         batch.blocks[0].lemmas.pop();
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, |batch| {
+    let (context, tx, _, _) = build_tally_batch_tx(2, false, |_, batch| {
         batch.blocks[0].block_number += 1;
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, |batch| {
+    let (context, tx, _, _) = build_tally_batch_tx(2, false, |_, batch| {
         let raw = RawTransaction::from_slice(&batch.blocks[0].transactions[0].raw_transaction)
             .unwrap()
             .as_builder()
@@ -966,8 +1002,33 @@ fn tally_contract_rejects_malformed_block_multiproofs() {
 }
 
 #[test]
+fn tally_contract_rejects_incorrect_output_amount() {
+    let (context, tx, _, _) = build_tally_batch_tx(1, false, |output, _| {
+        output.no -= CKB as u128;
+    });
+    assert!(context.verify_tx(&tx, 100_000_000).is_err());
+}
+
+#[test]
+fn tally_contract_rejects_tampered_proven_vote_amount() {
+    let (context, tx, _, _) = build_tally_batch_tx(1, false, |_, batch| {
+        let proven_vote = &mut batch.blocks[0].transactions[0];
+        let raw = RawTransaction::from_slice(&proven_vote.raw_transaction).unwrap();
+        let output_data = raw.outputs_data().get(0).unwrap().raw_data();
+        let mut vote = VoteData::decode(&output_data).unwrap();
+        vote.amount -= CKB;
+        let tampered = raw
+            .as_builder()
+            .outputs_data([Bytes::from(vote.encode().unwrap())].pack())
+            .build();
+        proven_vote.raw_transaction = tampered.as_slice().to_vec();
+    });
+    assert!(context.verify_tx(&tx, 100_000_000).is_err());
+}
+
+#[test]
 fn tally_contract_accepts_partial_block_multiproof() {
-    let (context, tx, _, _) = build_tally_batch_tx(2, true, |batch| {
+    let (context, tx, _, _) = build_tally_batch_tx(2, true, |_, batch| {
         assert!(!batch.blocks[0].lemmas.is_empty());
         assert_eq!(batch.blocks[0].transactions.len(), 2);
         assert_eq!(batch.blocks[0].tx_count, 4);
