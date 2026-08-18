@@ -168,7 +168,10 @@ flowchart TD
 
 The proposal fixes `max_events_per_batch`, `max_dao_deps_per_vote`,
 `max_state_keys_per_batch`, `max_batch_witness_bytes`, and
-`max_batch_sequence`. These are consensus-enforced limits, not SDK hints.
+`max_batch_sequence`. These are consensus-enforced limits, not SDK hints. The raw
+Tally witness byte length is checked before decoding variable-length proof and
+event vectors, so an oversized witness cannot force allocations before the
+configured limit is applied.
 
 An empty batch is valid only when it preserves the unified root in all three
 layout fields, both tally totals, and carries no transitions, prior records, or

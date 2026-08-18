@@ -127,10 +127,7 @@ fn advance() -> Result<(), Error> {
     require_operator(input.operator_lock_hash)?;
     let (proposal, config) = load_proposal_dep(input.proposal_id)?;
     ensure_tally_identity(&config)?;
-    let (witness, witness_len) = load_tally_witness()?;
-    if witness_len > proposal.max_batch_witness_bytes as usize {
-        return Err(Error::BatchLimit);
-    }
+    let witness = load_tally_witness(proposal.max_batch_witness_bytes as usize)?;
     let TallyWitness::Advance(batch) = witness else {
         return Err(Error::WitnessInvalid);
     };
@@ -142,7 +139,9 @@ fn consume() -> Result<(), Error> {
     if state.phase != TallyPhase::Candidate {
         return Err(Error::InvalidTransition);
     }
-    match load_tally_witness()?.0 {
+    let (limit_proposal, _) =
+        load_proposal_dep(state.proposal_id).or_else(|_| load_proposal_input(state.proposal_id))?;
+    match load_tally_witness(limit_proposal.max_batch_witness_bytes as usize)? {
         TallyWitness::ChallengeVote {
             omitted,
             event_proof,
@@ -815,7 +814,7 @@ fn ensure_tally_identity(config: &ProposalConfig) -> Result<(), Error> {
     }
 }
 
-fn load_tally_witness() -> Result<(TallyWitness, usize), Error> {
+fn load_tally_witness(max_len: usize) -> Result<TallyWitness, Error> {
     let witness = load_witness_args(0, Source::GroupInput).map_err(|_| Error::WitnessInvalid)?;
     let input_type = witness
         .input_type()
@@ -823,9 +822,10 @@ fn load_tally_witness() -> Result<(TallyWitness, usize), Error> {
         .ok_or(Error::WitnessInvalid)?
         .raw_data();
     let len = input_type.len();
-    TallyWitness::decode(&input_type)
-        .map(|witness| (witness, len))
-        .map_err(|_| Error::WitnessInvalid)
+    if len > max_len {
+        return Err(Error::BatchLimit);
+    }
+    TallyWitness::decode(&input_type).map_err(|_| Error::WitnessInvalid)
 }
 
 fn latest_header_number() -> Result<u64, Error> {
