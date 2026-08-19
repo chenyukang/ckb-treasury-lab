@@ -418,6 +418,7 @@ fn run() -> AnyResult<()> {
     let vote2_funding = find_cell(&cells, &voter2_lock, 500 * CKB)?;
     let omitted_bond_funding = find_cell(&cells, &operator_lock, 5_000 * CKB)?;
     let complete_bond_funding = find_cell(&cells, &operator_lock, 5_100 * CKB)?;
+    let operator_auth_funding = find_cell(&cells, &operator_lock, 100 * CKB)?;
     let challenger_funding = find_cell(&cells, &challenger_lock, 100 * CKB)?;
     let proposal_config_cell = cells
         .iter()
@@ -774,6 +775,7 @@ fn run() -> AnyResult<()> {
                 &complete_candidate_cell.out_point,
                 0x8000_0000_0000_0000 | closed_proposal.challenge_period,
             ),
+            input(&operator_auth_funding.out_point),
         ],
         vec![
             code_dep(&code_cells.always),
@@ -790,8 +792,17 @@ fn run() -> AnyResult<()> {
                 &operator_lock,
                 None,
             ),
+            output(
+                capacity(&operator_auth_funding.output),
+                &operator_lock,
+                None,
+            ),
         ],
-        vec![Bytes::from(result_data.encode()), Bytes::new()],
+        vec![
+            Bytes::from(result_data.encode()),
+            Bytes::new(),
+            Bytes::new(),
+        ],
         vec![
             Bytes::new(),
             input_type_witness(
@@ -1015,6 +1026,7 @@ fn write_chain_spec(
         (500 * CKB, 0x12),
         (5_000 * CKB, 0x21),
         (5_100 * CKB, 0x21),
+        (100 * CKB, 0x21),
         (100 * CKB, 0x22),
     ] {
         append_issued_plain(
