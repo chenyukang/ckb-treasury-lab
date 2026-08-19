@@ -99,7 +99,7 @@ fn create() -> Result<(), Error> {
         return Err(Error::InvalidState);
     }
     let bond = load_cell_capacity(0, Source::GroupOutput).map_err(|_| Error::BondTooSmall)?;
-    if bond < config.minimum_tally_bond || bond < proposal.requested_amount {
+    if bond < config.minimum_tally_bond {
         return Err(Error::BondTooSmall);
     }
     require_operator(state.operator_lock_hash)

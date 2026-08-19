@@ -317,7 +317,7 @@ fn run() -> AnyResult<()> {
         minimum_total_votes: 2_000 * CKB as u128,
         maximum_proposal_amount: 1_000 * CKB,
         minimum_challenge_period: 5,
-        minimum_tally_bond: 1_000 * CKB,
+        minimum_tally_bond: 5_000 * CKB,
         treasury_lock_hash: packed_hash(&treasury_lock.calc_script_hash()),
         dao_code_hash: packed_hash(&dao_type.code_hash()),
         dao_hash_type: TYPE_HASH_TYPE,
@@ -415,8 +415,8 @@ fn run() -> AnyResult<()> {
     let vote1_funding = find_cell(&cells, &voter1_lock, 500 * CKB)?;
     let dao2_funding = find_cell(&cells, &voter2_lock, 1_100 * CKB)?;
     let vote2_funding = find_cell(&cells, &voter2_lock, 500 * CKB)?;
-    let omitted_bond_funding = find_cell(&cells, &operator_lock, 2_000 * CKB)?;
-    let complete_bond_funding = find_cell(&cells, &operator_lock, 2_100 * CKB)?;
+    let omitted_bond_funding = find_cell(&cells, &operator_lock, 5_000 * CKB)?;
+    let complete_bond_funding = find_cell(&cells, &operator_lock, 5_100 * CKB)?;
     let proposal_config_cell = cells
         .iter()
         .find(|cell| cell.output.type_().to_opt().as_ref() == Some(&proposal_config_type))
@@ -1005,8 +1005,8 @@ fn write_chain_spec(
         (500 * CKB, 0x11),
         (1_100 * CKB, 0x12),
         (500 * CKB, 0x12),
-        (2_000 * CKB, 0x21),
-        (2_100 * CKB, 0x21),
+        (5_000 * CKB, 0x21),
+        (5_100 * CKB, 0x21),
     ] {
         append_issued_plain(
             &mut spec,
