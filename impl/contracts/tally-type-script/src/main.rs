@@ -10,7 +10,8 @@ use ckb_std::{
     ckb_constants::Source,
     high_level::{
         QueryIter, load_cell_capacity, load_cell_data, load_cell_lock_hash, load_cell_type,
-        load_cell_type_hash, load_header, load_input_since, load_script, load_witness_args,
+        load_cell_type_hash, load_header, load_input, load_input_since, load_script,
+        load_witness_args,
     },
     since::{LockValue, Since},
     type_id::check_type_id,
@@ -428,41 +429,28 @@ fn challenge_vote(
 ) -> Result<(), Error> {
     ensure_in_voting_window(omitted, proposal)?;
     let (raw, tx_hash) = verify_proven_transaction(omitted)?;
-    let mut voter_lock_hash = None;
-    for output in raw.outputs() {
-        if output
+    let has_vote = raw.outputs().into_iter().any(|output| {
+        output
             .type_()
             .to_opt()
             .is_some_and(|script| is_vote_script(&script, config, state.proposal_id))
-            && voter_lock_hash
-                .replace(
-                    output
-                        .lock()
-                        .calc_script_hash()
-                        .as_slice()
-                        .try_into()
-                        .unwrap(),
-                )
-                .is_some()
-        {
-            return Err(Error::ChallengeInvalid);
-        }
-    }
-    let voter_lock_hash = voter_lock_hash.ok_or(Error::ChallengeInvalid)?;
+    });
     let root = unified_root(state).ok_or(Error::InvalidState)?;
-    if !verify_smt_transition(
-        root,
-        root,
-        proof,
-        &[LeafTransition {
-            key: state_key(EVENT_STATE_NAMESPACE, tx_hash),
-            old_value: ZERO,
-            new_value: ZERO,
-        }],
-    ) {
+    if !has_vote
+        || !verify_smt_transition(
+            root,
+            root,
+            proof,
+            &[LeafTransition {
+                key: state_key(EVENT_STATE_NAMESPACE, tx_hash),
+                old_value: ZERO,
+                new_value: ZERO,
+            }],
+        )
+    {
         return Err(Error::ChallengeInvalid);
     }
-    pay_bond(voter_lock_hash)
+    pay_bond(challenge_sender_lock_hash()?)
 }
 
 fn challenge_spend(
@@ -505,7 +493,7 @@ fn challenge_spend(
     {
         return Err(Error::ChallengeInvalid);
     }
-    pay_bond(voter_lock_hash)
+    pay_bond(challenge_sender_lock_hash()?)
 }
 
 fn finalize(state: &TallyState, proposal: &ProposalData) -> Result<(), Error> {
@@ -732,26 +720,36 @@ fn require_operator(operator_lock_hash: Hash) -> Result<(), Error> {
     }
 }
 
+fn challenge_sender_lock_hash() -> Result<Hash, Error> {
+    let candidate = load_input(0, Source::GroupInput)
+        .map_err(|_| Error::ChallengeInvalid)?
+        .previous_output();
+    for (index, input) in QueryIter::new(load_input, Source::Input).enumerate() {
+        if input.previous_output().as_slice() != candidate.as_slice() {
+            return load_cell_lock_hash(index, Source::Input).map_err(|_| Error::ChallengeInvalid);
+        }
+    }
+    Err(Error::ChallengeInvalid)
+}
+
 fn pay_bond(recipient_lock_hash: Hash) -> Result<(), Error> {
     let bond = load_cell_capacity(0, Source::GroupInput).map_err(|_| Error::BondOutputInvalid)?;
     let mut found = None;
     for (index, lock_hash) in QueryIter::new(load_cell_lock_hash, Source::Output).enumerate() {
-        if lock_hash == recipient_lock_hash && found.replace(index).is_some() {
+        let is_reward = lock_hash == recipient_lock_hash
+            && load_cell_capacity(index, Source::Output).map_err(|_| Error::BondOutputInvalid)?
+                == bond
+            && load_cell_type(index, Source::Output)
+                .map_err(|_| Error::BondOutputInvalid)?
+                .is_none()
+            && load_cell_data(index, Source::Output)
+                .map_err(|_| Error::BondOutputInvalid)?
+                .is_empty();
+        if is_reward && found.replace(index).is_some() {
             return Err(Error::BondOutputInvalid);
         }
     }
-    let index = found.ok_or(Error::BondOutputInvalid)?;
-    if load_cell_capacity(index, Source::Output).map_err(|_| Error::BondOutputInvalid)? != bond
-        || load_cell_type(index, Source::Output)
-            .map_err(|_| Error::BondOutputInvalid)?
-            .is_some()
-        || !load_cell_data(index, Source::Output)
-            .map_err(|_| Error::BondOutputInvalid)?
-            .is_empty()
-    {
-        return Err(Error::BondOutputInvalid);
-    }
-    Ok(())
+    found.map(|_| ()).ok_or(Error::BondOutputInvalid)
 }
 
 fn load_state(index: usize, source: Source) -> Result<TallyState, Error> {

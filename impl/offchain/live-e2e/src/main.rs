@@ -408,6 +408,7 @@ fn run() -> AnyResult<()> {
     let voter1_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x11]);
     let voter2_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x12]);
     let operator_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x21]);
+    let challenger_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x22]);
     let receiver_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x31]);
 
     let proposal_funding = find_cell(&cells, &proposer_lock, 1_500 * CKB)?;
@@ -417,6 +418,7 @@ fn run() -> AnyResult<()> {
     let vote2_funding = find_cell(&cells, &voter2_lock, 500 * CKB)?;
     let omitted_bond_funding = find_cell(&cells, &operator_lock, 5_000 * CKB)?;
     let complete_bond_funding = find_cell(&cells, &operator_lock, 5_100 * CKB)?;
+    let challenger_funding = find_cell(&cells, &challenger_lock, 100 * CKB)?;
     let proposal_config_cell = cells
         .iter()
         .find(|cell| cell.output.type_().to_opt().as_ref() == Some(&proposal_config_type))
@@ -655,7 +657,10 @@ fn run() -> AnyResult<()> {
         "build omitted-vote challenge",
     )?;
     let challenge_tx = transaction(
-        vec![input(&omitted_candidate_cell.out_point)],
+        vec![
+            input(&omitted_candidate_cell.out_point),
+            input(&challenger_funding.out_point),
+        ],
         vec![
             code_dep(&code_cells.always),
             code_dep(&code_cells.tally),
@@ -663,12 +668,15 @@ fn run() -> AnyResult<()> {
             code_dep(&proposal_config_cell.out_point),
         ],
         vec![omitted_vote_block.block_hash],
-        vec![output(
-            capacity(&omitted_candidate_cell.output),
-            &voter2_lock,
-            None,
-        )],
-        vec![Bytes::new()],
+        vec![
+            output(
+                capacity(&omitted_candidate_cell.output),
+                &challenger_lock,
+                None,
+            ),
+            output(capacity(&challenger_funding.output), &challenger_lock, None),
+        ],
+        vec![Bytes::new(), Bytes::new()],
         vec![input_type_witness(challenge_witness.encode().map_err(
             |error| other(format!("encode challenge witness: {error:?}")),
         )?)],
@@ -1007,6 +1015,7 @@ fn write_chain_spec(
         (500 * CKB, 0x12),
         (5_000 * CKB, 0x21),
         (5_100 * CKB, 0x21),
+        (100 * CKB, 0x22),
     ] {
         append_issued_plain(
             &mut spec,

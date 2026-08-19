@@ -26,5 +26,6 @@ inside CKB-VM. Every TallySession transaction includes the referenced Proposal
 Config Cell and verifies both the Proposal and Tally code identities against it.
 The final candidate has one challenge period. A valid omitted-vote or
 omitted-DAO-spend proof consumes the candidate and transfers its bond to the
-affected voter proven by that omission. A mature candidate can create one Result Cell under the Policy Type
-Script authorized by Proposal Config.
+lock of the first non-Candidate input in the challenge transaction. A mature
+candidate can create one Result Cell under the Policy Type Script authorized by
+Proposal Config.

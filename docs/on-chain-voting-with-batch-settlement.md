@@ -17,7 +17,7 @@ flowchart LR
     S --> B1["Batch 1: block CBMT multiproofs + SMT transition"]
     B1 --> BN["Batch N: consume prior session"]
     BN --> F["FinalCandidate"]
-    F -->|"valid omission proof"| X["Candidate removed; bond to omitted voter"]
+    F -->|"valid omission proof"| X["Candidate removed; bond to challenger"]
     F -->|"challenge period expires"| R["Passed or Failed Result Cell"]
     R -->|"passed"| T["Treasury payout"]
     R -->|"failed"| Z["No treasury access"]
@@ -217,10 +217,19 @@ Two V4 challenges are supported:
   superseded vote from producing a false challenge.
 
 A successful challenge consumes the candidate and pays its entire bond to the
-voter lock hash authenticated by the omission proof. The recipient is not a
-witness parameter, so a mempool observer can relay or copy the proof but cannot
-redirect the reward. The challenge does not rewrite history. Another operator
-can start a fresh session from the Closed Proposal.
+challenge transaction sender. CKB transactions have no native sender field, so
+the contract defines the sender as the lock hash of the first input other than
+the Candidate Cell. The challenge must include this authorization/fee input and
+one plain output with exactly the Candidate bond under the same lock. The sender
+lock hash is derived from transaction inputs and is not carried in the witness.
+
+This one-transaction flow does not provide consensus-level front-running
+protection: a mempool observer can copy the public omission proof, rebuild the
+transaction with an input they control, and compete to consume the same
+Candidate Cell. Deployments accept this trade-off unless they add a private
+relay or a separate commit-reveal protocol. A successful challenge does not
+rewrite history; another operator can start a fresh session from the Closed
+Proposal.
 
 ## Passing policy
 

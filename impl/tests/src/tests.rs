@@ -1506,11 +1506,19 @@ fn omitted_vote_challenge_slashes_candidate_bond() {
             .build(),
         Bytes::from(candidate.encode()),
     );
+    let sender_capacity = 100 * CKB;
+    let challenger_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(sender_capacity)
+            .lock(challenger_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
     let witness = WitnessArgs::new_builder()
         .input_type(Some(Bytes::from(challenge.encode().unwrap())).pack())
         .build();
-    let build = |recipient_lock: Script| {
-        TransactionBuilder::default()
+    let build = |recipient_lock: Script, include_sender: bool| {
+        let mut builder = TransactionBuilder::default()
             .cell_dep(
                 CellDep::new_builder()
                     .out_point(proposal_cell.clone())
@@ -1534,12 +1542,29 @@ fn omitted_vote_challenge_slashes_candidate_bond() {
                     .build(),
             )
             .output_data(Bytes::new().pack())
-            .witness(witness.as_bytes().pack())
-            .build()
+            .witness(witness.as_bytes().pack());
+        if include_sender {
+            builder = builder
+                .input(
+                    CellInput::new_builder()
+                        .previous_output(challenger_cell.clone())
+                        .build(),
+                )
+                .output(
+                    CellOutput::new_builder()
+                        .capacity(sender_capacity)
+                        .lock(challenger_lock.clone())
+                        .build(),
+                )
+                .output_data(Bytes::new().pack());
+        }
+        builder.build()
     };
-    let front_run = context.complete_tx(build(challenger_lock));
-    assert!(context.verify_tx(&front_run, 100_000_000).is_err());
-    let tx = context.complete_tx(build(session_lock));
+    let missing_sender = context.complete_tx(build(challenger_lock.clone(), false));
+    assert!(context.verify_tx(&missing_sender, 100_000_000).is_err());
+    let redirected = context.complete_tx(build(session_lock, true));
+    assert!(context.verify_tx(&redirected, 100_000_000).is_err());
+    let tx = context.complete_tx(build(challenger_lock.clone(), true));
     context.verify_tx(&tx, 100_000_000).unwrap();
 }
 
@@ -1550,6 +1575,9 @@ fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
     let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
     let session_lock = context
         .build_script(&always_success, Bytes::from(vec![1]))
+        .unwrap();
+    let challenger_lock = context
+        .build_script(&always_success, Bytes::from(vec![9]))
         .unwrap();
     let proposal_type = context
         .build_script(&always_success, Bytes::from(vec![2]))
@@ -1626,10 +1654,18 @@ fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
     let candidate_cell = context.create_cell(
         CellOutput::new_builder()
             .capacity(bond)
-            .lock(session_lock.clone())
+            .lock(session_lock)
             .type_(Some(tally_script).pack())
             .build(),
         Bytes::from(candidate.encode()),
+    );
+    let sender_capacity = 100 * CKB;
+    let challenger_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(sender_capacity)
+            .lock(challenger_lock.clone())
+            .build(),
+        Bytes::new(),
     );
     let witness = WitnessArgs::new_builder()
         .input_type(Some(Bytes::from(challenge.encode().unwrap())).pack())
@@ -1643,10 +1679,22 @@ fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
                 .previous_output(candidate_cell)
                 .build(),
         )
+        .input(
+            CellInput::new_builder()
+                .previous_output(challenger_cell)
+                .build(),
+        )
         .output(
             CellOutput::new_builder()
                 .capacity(bond)
-                .lock(session_lock)
+                .lock(challenger_lock.clone())
+                .build(),
+        )
+        .output_data(Bytes::new().pack())
+        .output(
+            CellOutput::new_builder()
+                .capacity(sender_capacity)
+                .lock(challenger_lock)
                 .build(),
         )
         .output_data(Bytes::new().pack())
