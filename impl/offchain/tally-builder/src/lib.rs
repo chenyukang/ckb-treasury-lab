@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ckb_gen_types::{packed::RawTransaction, prelude::*};
+use ckb_gen_types::{
+    packed::{RawTransaction, Transaction, WitnessArgs},
+    prelude::*,
+};
 use merkle_cbt::CBMT;
 use sparse_merkle_tree::{
     H256, SparseMerkleTree, blake2b::Blake2bHasher, default_store::DefaultStore,
@@ -43,6 +46,18 @@ impl<E> From<BuilderError> for ScanError<E> {
     }
 }
 
+#[derive(Debug)]
+pub enum ReplayError<E> {
+    Builder(BuilderError),
+    Source(E),
+}
+
+impl<E> From<BuilderError> for ReplayError<E> {
+    fn from(error: BuilderError) -> Self {
+        Self::Builder(error)
+    }
+}
+
 pub trait ChainSource {
     type Error;
 
@@ -52,6 +67,14 @@ pub trait ChainSource {
         &self,
         transaction: ckb_gen_types::packed::Transaction,
     ) -> Result<Hash, Self::Error>;
+}
+
+/// Supplies committed transactions needed to reconstruct a tally session from
+/// its candidate output back to the initialization transaction.
+pub trait TransactionSource {
+    type Error;
+
+    fn transaction_by_hash(&self, tx_hash: Hash) -> Result<Transaction, Self::Error>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -450,6 +473,117 @@ impl TallyBuilder {
         Ok((output_state, witness))
     }
 
+    /// Reconstructs the complete SMT behind a candidate using only committed
+    /// tally transactions and their on-chain advance witnesses.
+    pub fn replay_candidate<S: TransactionSource>(
+        proposal_id: Hash,
+        proposal: &ProposalData,
+        config: ProposalConfig,
+        source: &S,
+        candidate_out_point: OutPoint,
+    ) -> Result<Self, ReplayError<S::Error>> {
+        let mut current_transaction = load_source_transaction(source, candidate_out_point.tx_hash)?;
+        let (tally_type, candidate_state) =
+            tally_output(&current_transaction, candidate_out_point)?;
+        if tally_type.code_hash().as_slice() != config.tally_code_hash
+            || tally_type.hash_type().as_slice()[0] != config.tally_hash_type
+            || candidate_state.phase != TallyPhase::Candidate
+            || candidate_state.proposal_id != proposal_id
+            || candidate_state.sequence == 0
+            || candidate_state.sequence > proposal.max_batch_sequence as u32
+        {
+            return Err(BuilderError::InvalidState.into());
+        }
+
+        let mut current_state = candidate_state.clone();
+        let mut reversed_steps = Vec::with_capacity(current_state.sequence as usize);
+        while current_state.sequence != 0 {
+            let mut tally_input = None;
+            for (input_index, input) in current_transaction.raw().inputs().into_iter().enumerate() {
+                let previous_out_point = unpack_out_point(&input.previous_output());
+                let previous_transaction =
+                    load_source_transaction(source, previous_out_point.tx_hash)?;
+                let Ok((previous_type, previous_state)) =
+                    tally_output(&previous_transaction, previous_out_point)
+                else {
+                    continue;
+                };
+                if previous_type != tally_type {
+                    continue;
+                }
+                if tally_input.is_some() {
+                    return Err(BuilderError::InvalidState.into());
+                }
+                let batch = advance_witness(&current_transaction, input_index)?;
+                tally_input = Some((previous_transaction, previous_state, batch));
+            }
+            let (previous_transaction, previous_state, batch) =
+                tally_input.ok_or(BuilderError::InvalidState)?;
+            if previous_state.sequence.checked_add(1) != Some(current_state.sequence) {
+                return Err(BuilderError::InvalidState.into());
+            }
+            reversed_steps.push((previous_state.clone(), current_state, batch));
+            current_transaction = previous_transaction;
+            current_state = previous_state;
+        }
+
+        let mut replayed = Self::new(
+            candidate_state.proposal_id,
+            current_state.operator_lock_hash,
+            proposal.start_block,
+            config,
+        );
+        if replayed.state != current_state {
+            return Err(BuilderError::InvalidState.into());
+        }
+        for (input_state, expected_output, batch) in reversed_steps.into_iter().rev() {
+            if replayed.state != input_state {
+                return Err(BuilderError::InvalidState.into());
+            }
+            let (actual_output, _) = replayed.build_batch(
+                proposal,
+                batch.blocks.clone(),
+                batch.end_block,
+                batch.end_tx_index,
+                expected_output.candidate_since,
+            )?;
+            if actual_output != expected_output {
+                return Err(BuilderError::InvalidState.into());
+            }
+        }
+        if replayed.state != candidate_state {
+            return Err(BuilderError::InvalidState.into());
+        }
+        Ok(replayed)
+    }
+
+    pub fn build_omitted_vote_challenge_from_candidate<S: TransactionSource>(
+        proposal_id: Hash,
+        proposal: &ProposalData,
+        config: ProposalConfig,
+        source: &S,
+        candidate_out_point: OutPoint,
+        omitted: ProvenTransaction,
+    ) -> Result<treasury_common::TallyWitness, ReplayError<S::Error>> {
+        Self::replay_candidate(proposal_id, proposal, config, source, candidate_out_point)?
+            .build_omitted_vote_challenge(omitted)
+            .map_err(Into::into)
+    }
+
+    pub fn build_omitted_spend_challenge_from_candidate<S: TransactionSource>(
+        proposal_id: Hash,
+        proposal: &ProposalData,
+        config: ProposalConfig,
+        source: &S,
+        candidate_out_point: OutPoint,
+        omitted_spend: ProvenTransaction,
+        dao_out_point: OutPoint,
+    ) -> Result<treasury_common::TallyWitness, ReplayError<S::Error>> {
+        Self::replay_candidate(proposal_id, proposal, config, source, candidate_out_point)?
+            .build_omitted_spend_challenge(omitted_spend, dao_out_point)
+            .map_err(Into::into)
+    }
+
     pub fn build_omitted_vote_challenge(
         &self,
         omitted: ProvenTransaction,
@@ -703,6 +837,70 @@ impl TallyBuilder {
     }
 }
 
+fn load_source_transaction<S: TransactionSource>(
+    source: &S,
+    expected_hash: Hash,
+) -> Result<Transaction, ReplayError<S::Error>> {
+    let transaction = source
+        .transaction_by_hash(expected_hash)
+        .map_err(ReplayError::Source)?;
+    let actual_hash: Hash = transaction
+        .raw()
+        .calc_tx_hash()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    if actual_hash != expected_hash {
+        return Err(BuilderError::InvalidState.into());
+    }
+    Ok(transaction)
+}
+
+fn tally_output(
+    transaction: &Transaction,
+    out_point: OutPoint,
+) -> Result<(ckb_gen_types::packed::Script, TallyState), BuilderError> {
+    let index: usize = out_point
+        .index
+        .try_into()
+        .map_err(|_| BuilderError::InvalidState)?;
+    let output = transaction
+        .raw()
+        .outputs()
+        .get(index)
+        .ok_or(BuilderError::InvalidState)?;
+    let tally_type = output.type_().to_opt().ok_or(BuilderError::InvalidState)?;
+    let data = transaction
+        .raw()
+        .outputs_data()
+        .get(index)
+        .ok_or(BuilderError::InvalidState)?
+        .raw_data();
+    let state = TallyState::decode(&data).map_err(|_| BuilderError::InvalidState)?;
+    Ok((tally_type, state))
+}
+
+fn advance_witness(
+    transaction: &Transaction,
+    input_index: usize,
+) -> Result<BatchWitness, BuilderError> {
+    let witness = transaction
+        .witnesses()
+        .get(input_index)
+        .ok_or(BuilderError::Encoding)?;
+    let witness_args =
+        WitnessArgs::from_slice(&witness.raw_data()).map_err(|_| BuilderError::Encoding)?;
+    let input_type = witness_args
+        .input_type()
+        .to_opt()
+        .ok_or(BuilderError::Encoding)?
+        .raw_data();
+    match treasury_common::TallyWitness::decode(&input_type).map_err(|_| BuilderError::Encoding)? {
+        treasury_common::TallyWitness::Advance(batch) => Ok(batch),
+        _ => Err(BuilderError::Encoding),
+    }
+}
+
 pub fn prove_block_transactions(
     block_number: u64,
     header_dep_index: u16,
@@ -859,6 +1057,32 @@ mod tests {
         ProposalPhase, cbmt_multi_root, verify_cbmt_inclusion, verify_smt_transition,
     };
 
+    #[derive(Default)]
+    struct MemoryTransactionSource {
+        transactions: BTreeMap<Hash, Transaction>,
+    }
+
+    impl MemoryTransactionSource {
+        fn insert(&mut self, transaction: Transaction) -> OutPoint {
+            let tx_hash = transaction
+                .raw()
+                .calc_tx_hash()
+                .as_slice()
+                .try_into()
+                .unwrap();
+            self.transactions.insert(tx_hash, transaction);
+            OutPoint { tx_hash, index: 0 }
+        }
+    }
+
+    impl TransactionSource for MemoryTransactionSource {
+        type Error = ();
+
+        fn transaction_by_hash(&self, tx_hash: Hash) -> Result<Transaction, Self::Error> {
+            self.transactions.get(&tx_hash).cloned().ok_or(())
+        }
+    }
+
     fn proposal() -> ProposalData {
         ProposalData {
             phase: ProposalPhase::Closed,
@@ -905,6 +1129,67 @@ mod tests {
             .build()
             .as_slice()
             .to_vec()
+    }
+
+    fn packed_out_point(out_point: OutPoint) -> packed::OutPoint {
+        packed::OutPoint::new_builder()
+            .tx_hash(out_point.tx_hash.pack())
+            .index(out_point.index)
+            .build()
+    }
+
+    fn tally_transaction(
+        inputs: &[OutPoint],
+        tally_type: &packed::Script,
+        state: &TallyState,
+        advance_input_index: Option<(usize, BatchWitness)>,
+    ) -> Transaction {
+        let raw = packed::RawTransaction::new_builder()
+            .inputs(
+                inputs
+                    .iter()
+                    .map(|out_point| {
+                        packed::CellInput::new_builder()
+                            .previous_output(packed_out_point(*out_point))
+                            .build()
+                    })
+                    .collect::<Vec<_>>()
+                    .pack(),
+            )
+            .outputs(
+                [packed::CellOutput::new_builder()
+                    .type_(Some(tally_type.clone()).pack())
+                    .build()]
+                .pack(),
+            )
+            .outputs_data([Bytes::from(state.encode())].pack())
+            .build();
+        let mut witnesses = vec![Bytes::new(); inputs.len()];
+        if let Some((input_index, batch)) = advance_input_index {
+            witnesses[input_index] = WitnessArgs::new_builder()
+                .input_type(
+                    Some(Bytes::from(
+                        treasury_common::TallyWitness::Advance(batch)
+                            .encode()
+                            .unwrap(),
+                    ))
+                    .pack(),
+                )
+                .build()
+                .as_bytes();
+        }
+        Transaction::new_builder()
+            .raw(raw)
+            .witnesses(witnesses.pack())
+            .build()
+    }
+
+    fn funding_transaction() -> Transaction {
+        let raw = packed::RawTransaction::new_builder()
+            .outputs([packed::CellOutput::new_builder().build()].pack())
+            .outputs_data([Bytes::new()].pack())
+            .build();
+        Transaction::new_builder().raw(raw).build()
     }
 
     fn vote_and_spend_transactions(proposal_id: Hash) -> (Vec<u8>, Vec<u8>) {
@@ -1165,5 +1450,154 @@ mod tests {
                 .build_omitted_spend_challenge(spend, dao_out_point)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fresh_challenger_replays_candidate_history_before_building_proof() {
+        let proposal = proposal();
+        let config = proposal_config();
+        let proposal_id = [7; 32];
+        let operator_lock_hash = [8; 32];
+        let tally_type = packed::Script::new_builder()
+            .code_hash(config.tally_code_hash.pack())
+            .hash_type(config.tally_hash_type)
+            .args(Bytes::from(vec![42; 32]).pack())
+            .build();
+        let (vote_raw, spend_raw) = vote_and_spend_transactions(proposal_id);
+        let vote_block =
+            prove_block_transactions(10, 0, core::slice::from_ref(&vote_raw), [20; 32], &[0])
+                .unwrap();
+
+        let mut operator_builder = TallyBuilder::new(
+            proposal_id,
+            operator_lock_hash,
+            proposal.start_block,
+            config,
+        );
+        let initial_state = operator_builder.state().clone();
+        let (active_state, first_batch) = operator_builder
+            .build_batch(&proposal, vec![vote_block], 11, 0, 0)
+            .unwrap();
+        let (candidate_state, final_batch) = operator_builder
+            .build_batch(
+                &proposal,
+                Vec::new(),
+                proposal.end_block + 1,
+                0,
+                proposal.end_block,
+            )
+            .unwrap();
+        drop(operator_builder);
+
+        let mut source = MemoryTransactionSource::default();
+        let initial_out_point =
+            source.insert(tally_transaction(&[], &tally_type, &initial_state, None));
+        let funding_out_point = source.insert(funding_transaction());
+        let active_out_point = source.insert(tally_transaction(
+            &[funding_out_point, initial_out_point],
+            &tally_type,
+            &active_state,
+            Some((1, first_batch)),
+        ));
+        let candidate_out_point = source.insert(tally_transaction(
+            &[active_out_point],
+            &tally_type,
+            &candidate_state,
+            Some((0, final_batch)),
+        ));
+
+        let replayed = TallyBuilder::replay_candidate(
+            proposal_id,
+            &proposal,
+            config,
+            &source,
+            candidate_out_point,
+        )
+        .unwrap();
+        assert_eq!(replayed.state(), &candidate_state);
+
+        let omitted_raw = RawTransaction::from_slice(&vote_raw)
+            .unwrap()
+            .as_builder()
+            .version(1u32)
+            .build();
+        let omitted =
+            prove_transaction(12, 0, &[omitted_raw.as_slice().to_vec()], [21; 32], 0).unwrap();
+        let omitted_hash = omitted_raw.calc_tx_hash().as_slice().try_into().unwrap();
+        let challenge = TallyBuilder::build_omitted_vote_challenge_from_candidate(
+            proposal_id,
+            &proposal,
+            config,
+            &source,
+            candidate_out_point,
+            omitted,
+        )
+        .unwrap();
+        let treasury_common::TallyWitness::ChallengeVote { event_proof, .. } = challenge else {
+            panic!("expected omitted-vote challenge");
+        };
+        let event_key = state_key(EVENT_STATE_NAMESPACE, omitted_hash);
+        assert!(verify_smt_transition(
+            candidate_state.events_root,
+            candidate_state.events_root,
+            &event_proof,
+            &[LeafTransition {
+                key: event_key,
+                old_value: ZERO,
+                new_value: ZERO,
+            }],
+        ));
+
+        let omitted_spend =
+            prove_transaction(13, 0, core::slice::from_ref(&spend_raw), [22; 32], 0).unwrap();
+        let spend_hash = RawTransaction::from_slice(&spend_raw)
+            .unwrap()
+            .calc_tx_hash()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let dao_out_point = OutPoint {
+            tx_hash: [9; 32],
+            index: 0,
+        };
+        let spend_challenge = TallyBuilder::build_omitted_spend_challenge_from_candidate(
+            proposal_id,
+            &proposal,
+            config,
+            &source,
+            candidate_out_point,
+            omitted_spend,
+            dao_out_point,
+        )
+        .unwrap();
+        let treasury_common::TallyWitness::ChallengeSpend {
+            voter_lock_hash,
+            event_proof,
+            dao_proof,
+            ..
+        } = spend_challenge
+        else {
+            panic!("expected omitted-spend challenge");
+        };
+        assert!(verify_smt_transition(
+            candidate_state.events_root,
+            candidate_state.events_root,
+            &event_proof,
+            &[LeafTransition {
+                key: state_key(EVENT_STATE_NAMESPACE, spend_hash),
+                old_value: ZERO,
+                new_value: ZERO,
+            }],
+        ));
+        assert!(verify_smt_transition(
+            candidate_state.dao_root,
+            candidate_state.dao_root,
+            &dao_proof,
+            &[LeafTransition {
+                key: state_key(DAO_STATE_NAMESPACE, dao_out_point.key()),
+                old_value: voter_lock_hash,
+                new_value: voter_lock_hash,
+            }],
+        ));
     }
 }

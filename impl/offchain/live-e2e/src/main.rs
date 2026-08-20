@@ -22,8 +22,8 @@ use tally_builder::{
     prove_transaction,
 };
 use treasury_common::{
-    Hash, ProposalConfig, ProposalData, ProposalPhase, ResultData, TallyWitness, TreasuryConfig,
-    VoteData, blake2b_256,
+    Hash, OutPoint, ProposalConfig, ProposalData, ProposalPhase, ResultData, TallyWitness,
+    TreasuryConfig, VoteData, blake2b_256,
 };
 
 const CKB: u64 = 100_000_000;
@@ -640,6 +640,7 @@ fn run() -> AnyResult<()> {
         Some(&omitted_tally_type),
         omitted_candidate.encode(),
     );
+    drop(omitted_builder);
 
     let omitted_vote_block = voting_blocks
         .iter()
@@ -654,8 +655,18 @@ fn run() -> AnyResult<()> {
     )
     .map_err(|error| other(format!("build omitted vote proof: {error:?}")))?;
     let challenge_witness = map_builder(
-        omitted_builder.build_omitted_vote_challenge(omitted_proof),
-        "build omitted-vote challenge",
+        TallyBuilder::build_omitted_vote_challenge_from_candidate(
+            proposal_id,
+            &closed_proposal,
+            proposal_config,
+            &chain_source,
+            OutPoint {
+                tx_hash: omitted_candidate_commit.hash,
+                index: 0,
+            },
+            omitted_proof,
+        ),
+        "replay candidate and build omitted-vote challenge",
     )?;
     let challenge_tx = transaction(
         vec![

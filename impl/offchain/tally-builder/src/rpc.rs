@@ -5,14 +5,14 @@ use std::{
 };
 
 use ckb_gen_types::{packed, prelude::*};
-use ckb_jsonrpc_types::{Byte32, JsonBytes, Transaction};
+use ckb_jsonrpc_types::{Byte32, Either, JsonBytes, Transaction, TransactionWithStatusResponse};
 use merkle_cbt::CBMT;
 use reqwest::{Url, blocking::Client};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use treasury_common::{Hash, MergeHash, transactions_root};
 
-use crate::{ChainBlock, ChainSource};
+use crate::{ChainBlock, ChainSource, TransactionSource};
 
 #[derive(Debug)]
 pub enum RpcError {
@@ -21,7 +21,9 @@ pub enum RpcError {
     Protocol { code: i64, message: String },
     MissingResult,
     BlockNotFound(u64),
+    TransactionNotFound,
     InvalidBlock,
+    InvalidTransaction,
 }
 
 impl fmt::Display for RpcError {
@@ -34,7 +36,11 @@ impl fmt::Display for RpcError {
             }
             Self::MissingResult => write!(formatter, "CKB RPC response has no result"),
             Self::BlockNotFound(number) => write!(formatter, "CKB block {number} was not found"),
+            Self::TransactionNotFound => write!(formatter, "CKB transaction was not found"),
             Self::InvalidBlock => write!(formatter, "CKB RPC returned an invalid block"),
+            Self::InvalidTransaction => {
+                write!(formatter, "CKB RPC returned an invalid transaction")
+            }
         }
     }
 }
@@ -119,6 +125,21 @@ impl CkbRpcClient {
             .map(|hash| hash.0)
             .ok_or(RpcError::MissingResult)
     }
+
+    fn fetch_transaction(&self, tx_hash: Hash) -> Result<packed::Transaction, RpcError> {
+        let response = self
+            .call::<TransactionWithStatusResponse>(
+                "get_transaction",
+                json!([Byte32::new(tx_hash), "0x0", true]),
+            )?
+            .ok_or(RpcError::TransactionNotFound)?;
+        let transaction = response.transaction.ok_or(RpcError::TransactionNotFound)?;
+        match transaction.inner {
+            Either::Left(view) => Ok(view.inner.into()),
+            Either::Right(bytes) => packed::Transaction::from_slice(&bytes.into_bytes())
+                .map_err(|_| RpcError::InvalidTransaction),
+        }
+    }
 }
 
 impl ChainSource for CkbRpcClient {
@@ -130,6 +151,14 @@ impl ChainSource for CkbRpcClient {
 
     fn submit_transaction(&self, transaction: packed::Transaction) -> Result<Hash, Self::Error> {
         self.send_transaction(transaction)
+    }
+}
+
+impl TransactionSource for CkbRpcClient {
+    type Error = RpcError;
+
+    fn transaction_by_hash(&self, tx_hash: Hash) -> Result<packed::Transaction, Self::Error> {
+        self.fetch_transaction(tx_hash)
     }
 }
 
