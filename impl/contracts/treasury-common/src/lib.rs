@@ -8,7 +8,7 @@ use merkle_cbt::{MerkleProof, merkle_tree::Merge};
 use sparse_merkle_tree::{CompiledMerkleProof, H256, blake2b::Blake2bHasher};
 
 pub const VERSION: u8 = 1;
-pub const TALLY_WITNESS_VERSION: u8 = 4;
+pub const TALLY_WITNESS_VERSION: u8 = 5;
 pub const VOTE_STATE_NAMESPACE: u8 = 0;
 pub const DAO_STATE_NAMESPACE: u8 = 1;
 pub const EVENT_STATE_NAMESPACE: u8 = 2;
@@ -92,7 +92,7 @@ impl TryFrom<u8> for TallyPhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OutPoint {
     pub tx_hash: Hash,
     pub index: u32,
@@ -125,7 +125,7 @@ impl OutPoint {
 pub struct VoteData {
     pub direction: u8,
     pub amount: u64,
-    pub dao_dep_indices: Vec<u16>,
+    pub dao_out_points: Vec<OutPoint>,
 }
 
 impl VoteData {
@@ -141,34 +141,34 @@ impl VoteData {
         if count == 0 {
             return Err(CodecError::InvalidValue);
         }
-        let mut dao_dep_indices = Vec::with_capacity(count);
+        let mut dao_out_points = Vec::with_capacity(count);
         for _ in 0..count {
-            dao_dep_indices.push(reader.u16()?);
+            dao_out_points.push(OutPoint::decode(&mut reader)?);
         }
         reader.finish()?;
         Ok(Self {
             direction,
             amount,
-            dao_dep_indices,
+            dao_out_points,
         })
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        if self.direction > 1 || self.dao_dep_indices.is_empty() {
+        if self.direction > 1 || self.dao_out_points.is_empty() {
             return Err(CodecError::InvalidValue);
         }
         let count: u16 = self
-            .dao_dep_indices
+            .dao_out_points
             .len()
             .try_into()
             .map_err(|_| CodecError::Overflow)?;
-        let mut output = Vec::with_capacity(12 + self.dao_dep_indices.len() * 2);
+        let mut output = Vec::with_capacity(12 + self.dao_out_points.len() * OutPoint::ENCODED_LEN);
         output.push(VERSION);
         output.push(self.direction);
         output.extend_from_slice(&self.amount.to_le_bytes());
         output.extend_from_slice(&count.to_le_bytes());
-        for index in &self.dao_dep_indices {
-            output.extend_from_slice(&index.to_le_bytes());
+        for out_point in &self.dao_out_points {
+            out_point.encode_into(&mut output);
         }
         Ok(output)
     }
@@ -630,6 +630,7 @@ pub struct ProvenTransaction {
     pub tx_index: u32,
     pub tx_count: u32,
     pub raw_transaction: Vec<u8>,
+    pub vote: Option<ProvenVote>,
     pub witnesses_root: Hash,
     pub lemmas: Vec<Hash>,
 }
@@ -641,6 +642,7 @@ impl ProvenTransaction {
         let tx_index = reader.u32()?;
         let tx_count = reader.u32()?;
         let raw_transaction = reader.length_prefixed_bytes()?;
+        let vote = decode_optional_vote(reader)?;
         let witnesses_root = reader.hash()?;
         let lemma_count = reader.u16()? as usize;
         let mut lemmas = Vec::with_capacity(lemma_count);
@@ -653,6 +655,7 @@ impl ProvenTransaction {
             tx_index,
             tx_count,
             raw_transaction,
+            vote,
             witnesses_root,
             lemmas,
         })
@@ -675,6 +678,7 @@ impl ProvenTransaction {
         output.extend_from_slice(&self.tx_count.to_le_bytes());
         output.extend_from_slice(&raw_len.to_le_bytes());
         output.extend_from_slice(&self.raw_transaction);
+        encode_optional_vote(&self.vote, output)?;
         output.extend_from_slice(&self.witnesses_root);
         output.extend_from_slice(&lemma_count.to_le_bytes());
         for lemma in &self.lemmas {
@@ -685,22 +689,72 @@ impl ProvenTransaction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProvenBlockTransaction {
-    pub tx_index: u32,
-    pub raw_transaction: Vec<u8>,
+pub struct ProvenVote {
+    pub vote_cell: OutPoint,
+    pub cell_dep_index: u16,
+    pub voter_lock_hash: Hash,
+    pub data: VoteData,
 }
 
-impl ProvenBlockTransaction {
+impl ProvenVote {
     fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         Ok(Self {
-            tx_index: reader.u32()?,
-            raw_transaction: reader.length_prefixed_bytes()?,
+            vote_cell: OutPoint::decode(reader)?,
+            cell_dep_index: reader.u16()?,
+            voter_lock_hash: reader.hash()?,
+            data: VoteData::decode(&reader.length_prefixed_bytes()?)?,
         })
     }
 
     fn encode_into(&self, output: &mut Vec<u8>) -> Result<(), CodecError> {
+        self.vote_cell.encode_into(output);
+        output.extend_from_slice(&self.cell_dep_index.to_le_bytes());
+        output.extend_from_slice(&self.voter_lock_hash);
+        encode_length_prefixed(&self.data.encode()?, output)
+    }
+}
+
+fn decode_optional_vote(reader: &mut Reader<'_>) -> Result<Option<ProvenVote>, CodecError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => ProvenVote::decode(reader).map(Some),
+        _ => Err(CodecError::InvalidValue),
+    }
+}
+
+fn encode_optional_vote(vote: &Option<ProvenVote>, output: &mut Vec<u8>) -> Result<(), CodecError> {
+    if let Some(vote) = vote {
+        output.push(1);
+        vote.encode_into(output)
+    } else {
+        output.push(0);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvenBlockEvent {
+    pub tx_index: u32,
+    pub raw_transaction: Vec<u8>,
+    pub vote: Option<ProvenVote>,
+}
+
+impl ProvenBlockEvent {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            tx_index: reader.u32()?,
+            raw_transaction: reader.length_prefixed_bytes()?,
+            vote: decode_optional_vote(reader)?,
+        })
+    }
+
+    fn encode_into(&self, output: &mut Vec<u8>) -> Result<(), CodecError> {
+        if self.raw_transaction.is_empty() && self.vote.is_none() {
+            return Err(CodecError::InvalidValue);
+        }
         output.extend_from_slice(&self.tx_index.to_le_bytes());
-        encode_length_prefixed(&self.raw_transaction, output)
+        encode_length_prefixed(&self.raw_transaction, output)?;
+        encode_optional_vote(&self.vote, output)
     }
 }
 
@@ -710,7 +764,7 @@ pub struct ProvenBlock {
     pub header_dep_index: u16,
     pub tx_count: u32,
     pub witnesses_root: Hash,
-    pub transactions: Vec<ProvenBlockTransaction>,
+    pub events: Vec<ProvenBlockEvent>,
     pub lemmas: Vec<Hash>,
 }
 
@@ -720,10 +774,10 @@ impl ProvenBlock {
         let header_dep_index = reader.u16()?;
         let tx_count = reader.u32()?;
         let witnesses_root = reader.hash()?;
-        let transaction_count = reader.u16()? as usize;
-        let mut transactions = Vec::with_capacity(transaction_count);
-        for _ in 0..transaction_count {
-            transactions.push(ProvenBlockTransaction::decode(reader)?);
+        let event_count = reader.u16()? as usize;
+        let mut events = Vec::with_capacity(event_count);
+        for _ in 0..event_count {
+            events.push(ProvenBlockEvent::decode(reader)?);
         }
         let lemma_count = reader.u16()? as usize;
         let mut lemmas = Vec::with_capacity(lemma_count);
@@ -735,14 +789,14 @@ impl ProvenBlock {
             header_dep_index,
             tx_count,
             witnesses_root,
-            transactions,
+            events,
             lemmas,
         })
     }
 
     fn encode_into(&self, output: &mut Vec<u8>) -> Result<(), CodecError> {
-        let transaction_count: u16 = self
-            .transactions
+        let event_count: u16 = self
+            .events
             .len()
             .try_into()
             .map_err(|_| CodecError::Overflow)?;
@@ -755,9 +809,9 @@ impl ProvenBlock {
         output.extend_from_slice(&self.header_dep_index.to_le_bytes());
         output.extend_from_slice(&self.tx_count.to_le_bytes());
         output.extend_from_slice(&self.witnesses_root);
-        output.extend_from_slice(&transaction_count.to_le_bytes());
-        for transaction in &self.transactions {
-            transaction.encode_into(output)?;
+        output.extend_from_slice(&event_count.to_le_bytes());
+        for event in &self.events {
+            event.encode_into(output)?;
         }
         output.extend_from_slice(&lemma_count.to_le_bytes());
         for lemma in &self.lemmas {
@@ -832,9 +886,9 @@ impl BatchWitness {
     }
 
     pub fn event_count(&self) -> Option<usize> {
-        self.blocks.iter().try_fold(0usize, |count, block| {
-            count.checked_add(block.transactions.len())
-        })
+        self.blocks
+            .iter()
+            .try_fold(0usize, |count, block| count.checked_add(block.events.len()))
     }
 }
 
@@ -1503,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn tally_witness_uses_explicit_v4_encoding() {
+    fn tally_witness_uses_explicit_v5_encoding() {
         let encoded = TallyWitness::Finalize.encode().unwrap();
         assert_eq!(encoded[0], TALLY_WITNESS_VERSION);
         assert_eq!(TallyWitness::decode(&encoded), Ok(TallyWitness::Finalize));

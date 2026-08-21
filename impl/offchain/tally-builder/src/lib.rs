@@ -10,9 +10,9 @@ use sparse_merkle_tree::{
 };
 use treasury_common::{
     BatchWitness, DAO_STATE_NAMESPACE, EVENT_PRESENT, EVENT_STATE_NAMESPACE, Hash, LeafTransition,
-    MergeHash, OutPoint, ProposalConfig, ProposalData, ProvenBlock, ProvenBlockTransaction,
-    ProvenTransaction, TallyPhase, TallyState, VOTE_STATE_NAMESPACE, VoteData, VoteRecord,
-    namespaced_state_key,
+    MergeHash, OutPoint, ProposalConfig, ProposalData, ProvenBlock, ProvenBlockEvent,
+    ProvenTransaction, ProvenVote, TallyPhase, TallyState, VOTE_STATE_NAMESPACE, VoteData,
+    VoteRecord, namespaced_state_key,
 };
 
 mod rpc;
@@ -324,14 +324,14 @@ impl TallyBuilder {
     pub fn build_batch(
         &mut self,
         proposal: &ProposalData,
-        proven_blocks: Vec<ProvenBlock>,
+        mut proven_blocks: Vec<ProvenBlock>,
         end_block: u64,
         end_tx_index: u32,
         candidate_since: u64,
     ) -> Result<(TallyState, BatchWitness), BuilderError> {
-        let event_count = proven_blocks.iter().try_fold(0usize, |count, block| {
-            count.checked_add(block.transactions.len())
-        });
+        let event_count = proven_blocks
+            .iter()
+            .try_fold(0usize, |count, block| count.checked_add(block.events.len()));
         let event_count = event_count.ok_or(BuilderError::BatchLimit)?;
         if self.state.phase != TallyPhase::Active
             || event_count > proposal.max_events_per_batch as usize
@@ -356,33 +356,32 @@ impl TallyBuilder {
         let mut state_keys = BTreeSet::new();
         let mut previous_cursor = None;
         let mut previous_block = None;
-        for block in &proven_blocks {
-            if block.transactions.is_empty()
+        for block in &mut proven_blocks {
+            if block.events.is_empty()
                 || previous_block.is_some_and(|number| number >= block.block_number)
             {
                 return Err(BuilderError::InvalidEvent);
             }
             previous_block = Some(block.block_number);
             let mut previous_tx_index = None;
-            for transaction in &block.transactions {
-                let cursor = (block.block_number, transaction.tx_index);
+            for event in &mut block.events {
+                let cursor = (block.block_number, event.tx_index);
                 if cursor < input_cursor
                     || cursor >= output_cursor
                     || block.block_number < proposal.start_block
                     || block.block_number > proposal.end_block
-                    || transaction.tx_index >= block.tx_count
-                    || previous_tx_index.is_some_and(|index| index >= transaction.tx_index)
+                    || event.tx_index >= block.tx_count
+                    || previous_tx_index.is_some_and(|index| index >= event.tx_index)
                     || previous_cursor.is_some_and(|previous| cursor <= previous)
                 {
                     return Err(BuilderError::InvalidEvent);
                 }
-                previous_tx_index = Some(transaction.tx_index);
+                previous_tx_index = Some(event.tx_index);
                 previous_cursor = Some(cursor);
-                next.apply_event(
+                next.apply_proven_event(
                     proposal,
                     block.block_number,
-                    transaction.tx_index,
-                    &transaction.raw_transaction,
+                    event,
                     &mut vote_keys,
                     &mut state_keys,
                 )?;
@@ -586,11 +585,13 @@ impl TallyBuilder {
 
     pub fn build_omitted_vote_challenge(
         &self,
-        omitted: ProvenTransaction,
+        mut omitted: ProvenTransaction,
     ) -> Result<treasury_common::TallyWitness, BuilderError> {
         let raw = RawTransaction::from_slice(&omitted.raw_transaction)
             .map_err(|_| BuilderError::InvalidEvent)?;
         let tx_hash: Hash = raw.calc_tx_hash().as_slice().try_into().unwrap();
+        omitted.vote = Some(self.extract_vote(&raw, tx_hash)?);
+        omitted.raw_transaction.clear();
         let event_key = state_key(EVENT_STATE_NAMESPACE, tx_hash);
         if value(&self.committed_state, event_key)? != ZERO {
             return Err(BuilderError::InvalidEvent);
@@ -644,9 +645,46 @@ impl TallyBuilder {
         vote_keys: &mut BTreeSet<Hash>,
         state_keys: &mut BTreeSet<Hash>,
     ) -> Result<(), BuilderError> {
-        let raw =
-            RawTransaction::from_slice(raw_transaction).map_err(|_| BuilderError::InvalidEvent)?;
-        let tx_hash: Hash = raw.calc_tx_hash().as_slice().try_into().unwrap();
+        let mut event = ProvenBlockEvent {
+            tx_index,
+            raw_transaction: raw_transaction.to_vec(),
+            vote: None,
+        };
+        self.apply_proven_event(proposal, block_number, &mut event, vote_keys, state_keys)
+    }
+
+    fn apply_proven_event(
+        &mut self,
+        proposal: &ProposalData,
+        block_number: u64,
+        event: &mut ProvenBlockEvent,
+        vote_keys: &mut BTreeSet<Hash>,
+        state_keys: &mut BTreeSet<Hash>,
+    ) -> Result<(), BuilderError> {
+        let raw = if event.raw_transaction.is_empty() {
+            None
+        } else {
+            Some(
+                RawTransaction::from_slice(&event.raw_transaction)
+                    .map_err(|_| BuilderError::InvalidEvent)?,
+            )
+        };
+        let raw_hash = raw
+            .as_ref()
+            .map(|raw| raw.calc_tx_hash().as_slice().try_into().unwrap());
+        if event.vote.is_none()
+            && let (Some(raw), Some(tx_hash)) = (raw.as_ref(), raw_hash)
+        {
+            event.vote = self.extract_vote_optional(raw, tx_hash)?;
+        }
+        let tx_hash = match (raw_hash, event.vote.as_ref()) {
+            (Some(raw_hash), Some(vote)) if raw_hash != vote.vote_cell.tx_hash => {
+                return Err(BuilderError::InvalidEvent);
+            }
+            (Some(raw_hash), _) => raw_hash,
+            (None, Some(vote)) => vote.vote_cell.tx_hash,
+            (None, None) => return Err(BuilderError::InvalidEvent),
+        };
         let event_key = state_key(EVENT_STATE_NAMESPACE, tx_hash);
         if value(&self.committed_state, event_key)? != ZERO {
             return Err(BuilderError::InvalidEvent);
@@ -655,19 +693,67 @@ impl TallyBuilder {
         update(&mut self.committed_state, event_key, EVENT_PRESENT)?;
 
         let spent_out_points = raw
-            .inputs()
-            .into_iter()
-            .map(|input| unpack_out_point(&input.previous_output()))
-            .collect::<Vec<_>>();
+            .as_ref()
+            .map(|raw| {
+                raw.inputs()
+                    .into_iter()
+                    .map(|input| unpack_out_point(&input.previous_output()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut relevant = false;
+        let mut has_tracked_spend = false;
         for out_point in &spent_out_points {
             let key = state_key(DAO_STATE_NAMESPACE, out_point.key());
             let voter = value(&self.committed_state, key)?;
             if voter != ZERO {
                 self.remove_record(voter, vote_keys, state_keys)?;
                 relevant = true;
+                has_tracked_spend = true;
             }
         }
+        if let Some(vote) = &event.vote {
+            if vote.data.dao_out_points.len() > proposal.max_dao_deps_per_vote as usize {
+                return Err(BuilderError::BatchLimit);
+            }
+            if vote
+                .data
+                .dao_out_points
+                .iter()
+                .any(|out_point| spent_out_points.contains(out_point))
+            {
+                return Err(BuilderError::InvalidEvent);
+            }
+            self.apply_record(
+                VoteRecord {
+                    voter_lock_hash: vote.voter_lock_hash,
+                    direction: vote.data.direction,
+                    amount: vote.data.amount,
+                    block_number,
+                    tx_index: event.tx_index,
+                    dao_out_points: vote.data.dao_out_points.clone(),
+                },
+                vote_keys,
+                state_keys,
+            )?;
+            relevant = true;
+        }
+        if relevant {
+            if event.vote.is_some() && !has_tracked_spend {
+                event.raw_transaction.clear();
+            }
+            Ok(())
+        } else {
+            Err(BuilderError::InvalidEvent)
+        }
+    }
+
+    fn extract_vote_optional(
+        &self,
+        raw: &RawTransaction,
+        tx_hash: Hash,
+    ) -> Result<Option<ProvenVote>, BuilderError> {
+        let mut found = None;
         for (index, output) in raw.outputs().into_iter().enumerate() {
             let Some(type_script) = output.type_().to_opt() else {
                 continue;
@@ -678,56 +764,39 @@ impl TallyBuilder {
             {
                 continue;
             }
-            let vote_data = raw
+            if found.is_some() {
+                return Err(BuilderError::InvalidEvent);
+            }
+            let data = raw
                 .outputs_data()
                 .get(index)
                 .ok_or(BuilderError::InvalidEvent)?
                 .raw_data();
-            let vote = VoteData::decode(&vote_data).map_err(|_| BuilderError::InvalidEvent)?;
-            if vote.dao_dep_indices.len() > proposal.max_dao_deps_per_vote as usize {
-                return Err(BuilderError::BatchLimit);
-            }
-            let voter_lock_hash = output
-                .lock()
-                .calc_script_hash()
-                .as_slice()
-                .try_into()
-                .unwrap();
-            let dao_out_points = vote
-                .dao_dep_indices
-                .into_iter()
-                .map(|index| {
-                    raw.cell_deps()
-                        .get(index as usize)
-                        .map(|dep| unpack_out_point(&dep.out_point()))
-                        .ok_or(BuilderError::InvalidEvent)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if dao_out_points
-                .iter()
-                .any(|out_point| spent_out_points.contains(out_point))
-            {
-                return Err(BuilderError::InvalidEvent);
-            }
-            self.apply_record(
-                VoteRecord {
-                    voter_lock_hash,
-                    direction: vote.direction,
-                    amount: vote.amount,
-                    block_number,
-                    tx_index,
-                    dao_out_points,
+            found = Some(ProvenVote {
+                vote_cell: OutPoint {
+                    tx_hash,
+                    index: index.try_into().map_err(|_| BuilderError::InvalidEvent)?,
                 },
-                vote_keys,
-                state_keys,
-            )?;
-            relevant = true;
+                cell_dep_index: 0,
+                voter_lock_hash: output
+                    .lock()
+                    .calc_script_hash()
+                    .as_slice()
+                    .try_into()
+                    .unwrap(),
+                data: VoteData::decode(&data).map_err(|_| BuilderError::InvalidEvent)?,
+            });
         }
-        if relevant {
-            Ok(())
-        } else {
-            Err(BuilderError::InvalidEvent)
-        }
+        Ok(found)
+    }
+
+    fn extract_vote(
+        &self,
+        raw: &RawTransaction,
+        tx_hash: Hash,
+    ) -> Result<ProvenVote, BuilderError> {
+        self.extract_vote_optional(raw, tx_hash)?
+            .ok_or(BuilderError::InvalidEvent)
     }
 
     fn is_relevant(&self, raw: &RawTransaction) -> Result<bool, BuilderError> {
@@ -927,11 +996,12 @@ pub fn prove_block_transactions(
         .collect::<Result<Vec<Hash>, _>>()?;
     let proof = CBMT::<Hash, MergeHash>::build_merkle_proof(&hashes, tx_indices)
         .ok_or(BuilderError::InvalidEvent)?;
-    let transactions = tx_indices
+    let events = tx_indices
         .iter()
-        .map(|index| ProvenBlockTransaction {
+        .map(|index| ProvenBlockEvent {
             tx_index: *index,
             raw_transaction: raw_transactions[*index as usize].clone(),
+            vote: None,
         })
         .collect();
     Ok(ProvenBlock {
@@ -942,7 +1012,7 @@ pub fn prove_block_transactions(
             .try_into()
             .map_err(|_| BuilderError::BatchLimit)?,
         witnesses_root,
-        transactions,
+        events,
         lemmas: proof.lemmas().to_vec(),
     })
 }
@@ -973,6 +1043,7 @@ pub fn prove_transaction(
         tx_index,
         tx_count: hashes.len() as u32,
         raw_transaction: raw_transactions[tx_index as usize].clone(),
+        vote: None,
         witnesses_root,
         lemmas: proof.lemmas().to_vec(),
     })
@@ -1205,7 +1276,7 @@ mod tests {
         let vote_data = VoteData {
             direction: 1,
             amount: 100,
-            dao_dep_indices: vec![0],
+            dao_out_points: vec![unpack_out_point(&dao_out_point)],
         }
         .encode()
         .unwrap();
@@ -1264,7 +1335,7 @@ mod tests {
         ];
         let proven = prove_block_transactions(10, 0, &raws, [9; 32], &[0, 2, 3]).unwrap();
         let indexed = proven
-            .transactions
+            .events
             .iter()
             .map(|transaction| {
                 let raw = RawTransaction::from_slice(&transaction.raw_transaction).unwrap();
@@ -1380,7 +1451,7 @@ mod tests {
         assert_eq!((scanned.end_block, scanned.end_tx_index), (12, 0));
 
         let mut builder = builder;
-        let (candidate, _) = builder
+        let (candidate, batch) = builder
             .build_batch(
                 &proposal,
                 scanned.blocks,
@@ -1389,6 +1460,10 @@ mod tests {
                 scanned.candidate_since,
             )
             .unwrap();
+        assert!(batch.blocks[0].events[0].raw_transaction.is_empty());
+        assert!(batch.blocks[0].events[0].vote.is_some());
+        assert!(!batch.blocks[1].events[0].raw_transaction.is_empty());
+        assert!(batch.blocks[1].events[0].vote.is_none());
         assert_eq!(candidate.phase, TallyPhase::Candidate);
         assert_eq!(candidate.yes, 0);
     }

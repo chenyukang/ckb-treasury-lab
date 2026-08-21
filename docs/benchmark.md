@@ -78,6 +78,36 @@ figures are still preliminary: revote-heavy, multi-DAO-deposit, DAO-spend, spars
 cross-block, and adversarial proof shapes need separate measurements before the
 production cap is frozen.
 
+### V5 VoteEventCell position proofs
+
+V5 replaces each raw VoteTx in the tally witness with the immutable
+VoteEventCell outpoint, a direct CellDep index, voter lock hash, and canonical
+VoteData. Raw DAO-spend transactions and `ChallengeSpend` are unchanged. The
+same checkout immediately before the V5 change measured 59,119 witness bytes,
+59,876 transaction bytes, and 314,614,791 cycles for 100 votes.
+
+| Independent votes | CKB-VM cycles | Cycles per vote | Batch witness | Settlement tx |
+|---:|---:|---:|---:|---:|
+| 1 | 3,331,596 | 3,331,596 | 506 B | 1,300 B |
+| 10 | 31,532,187 | 3,153,218 | 4,403 B | 5,530 B |
+| 20 | 62,672,356 | 3,133,617 | 8,715 B | 10,212 B |
+| 50 | 156,132,217 | 3,122,644 | 21,693 B | 24,300 B |
+| 100 | 311,820,088 | 3,118,200 | 43,325 B | 47,782 B |
+| 200 | 623,495,528 | 3,117,477 | 86,573 B | 94,730 B |
+| 500 | 1,555,171,235 | 3,110,342 | 216,267 B | 235,524 B |
+
+At 100 votes, V5 reduces witness bytes by 26.7% and complete settlement
+transaction bytes by 20.2% relative to that V4 baseline. Cycles decrease by
+0.9%. Each vote adds one 37-byte CellDep to the settlement transaction, which is
+why total transaction bytes shrink less than witness bytes. The one-DAO
+VoteEventCell data grows from 14 to 48 bytes because it commits the actual DAO
+outpoint instead of a VoteTx-local CellDep index.
+
+The stripped tally contract grows from 226,040 to 229,904 bytes (+3,864, 1.7%),
+and the Vote contract grows from 67,896 to 71,304 bytes (+3,408, 5.0%). Both
+remain below the 400 KiB warning threshold. V5 does not reduce the size of a raw
+DAO-spend event; that path needs a separate worst-case benchmark and mitigation.
+
 ## Legacy node-scan proposal benchmark
 
 Unlike a normal script on CKB, the proposal type script needs to perform calculations over a large number of blocks, which could become a bottleneck. Hence we need to design a benchmark and measure it.

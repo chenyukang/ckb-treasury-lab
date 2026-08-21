@@ -16,11 +16,69 @@ use ckb_testtool::{
 use merkle_cbt::CBMT;
 use tally_builder::{TallyBuilder, prove_block_transactions, prove_transaction};
 use treasury_common::{
-    BatchWitness, MergeHash, ProposalConfig, ProposalData, ProposalPhase, ResultData, TallyPhase,
-    TallyState, TallyWitness, TreasuryConfig, VoteData, blake2b_256, hash_pair, transactions_root,
+    BatchWitness, MergeHash, ProposalConfig, ProposalData, ProposalPhase, ProvenVote, ResultData,
+    TallyPhase, TallyState, TallyWitness, TreasuryConfig, VoteData, blake2b_256, hash_pair,
+    transactions_root,
 };
 
 const CKB: u64 = 100_000_000;
+
+fn common_out_point(out_point: &OutPoint) -> treasury_common::OutPoint {
+    treasury_common::OutPoint {
+        tx_hash: out_point.tx_hash().as_slice().try_into().unwrap(),
+        index: out_point.index().unpack(),
+    }
+}
+
+fn packed_out_point(out_point: treasury_common::OutPoint) -> OutPoint {
+    OutPoint::new_builder()
+        .tx_hash(out_point.tx_hash.pack())
+        .index(out_point.index)
+        .build()
+}
+
+fn install_vote_cell(
+    context: &mut Context,
+    vote: &ProvenVote,
+    raw_transactions: &[Vec<u8>],
+) -> Option<CellDep> {
+    let raw = raw_transactions.iter().find_map(|bytes| {
+        let raw = RawTransaction::from_slice(bytes).ok()?;
+        let hash: [u8; 32] = raw.calc_tx_hash().as_slice().try_into().ok()?;
+        (hash == vote.vote_cell.tx_hash).then_some(raw)
+    })?;
+    let output = raw.outputs().get(vote.vote_cell.index as usize)?;
+    let data = raw
+        .outputs_data()
+        .get(vote.vote_cell.index as usize)?
+        .raw_data();
+    let out_point = packed_out_point(vote.vote_cell);
+    context.create_cell_with_out_point(out_point.clone(), output, data);
+    Some(CellDep::new_builder().out_point(out_point).build())
+}
+
+fn install_batch_vote_cells(
+    context: &mut Context,
+    batch: &mut BatchWitness,
+    raw_transactions: &[Vec<u8>],
+    first_dep_index: u16,
+) -> Vec<CellDep> {
+    let mut next_dep_index = first_dep_index;
+    let mut deps = Vec::new();
+    for vote in batch
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.events)
+        .filter_map(|event| event.vote.as_mut())
+    {
+        vote.cell_dep_index = next_dep_index;
+        if let Some(dep) = install_vote_cell(context, vote, raw_transactions) {
+            deps.push(dep);
+            next_dep_index = next_dep_index.checked_add(1).unwrap();
+        }
+    }
+    deps
+}
 
 fn proposal(_proposal_id: [u8; 32], _vote_code_hash: [u8; 32]) -> ProposalData {
     ProposalData {
@@ -334,7 +392,7 @@ fn historical_vote_raw(
     let vote_data = VoteData {
         direction: 1,
         amount: 500 * CKB,
-        dao_dep_indices: vec![0],
+        dao_out_points: vec![common_out_point(&dao_out_point)],
     }
     .encode()
     .unwrap();
@@ -387,7 +445,7 @@ fn historical_unique_vote_raw(
     let vote_data = VoteData {
         direction: u8::from(!voter.is_multiple_of(3)),
         amount: 500 * CKB,
-        dao_dep_indices: vec![0],
+        dao_out_points: vec![common_out_point(&dao_out_point)],
     }
     .encode()
     .unwrap();
@@ -494,7 +552,7 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
     let vote_data = VoteData {
         direction: 1,
         amount: dao_capacity,
-        dao_dep_indices: vec![2],
+        dao_out_points: vec![common_out_point(&dao_cell)],
     }
     .encode()
     .unwrap();
@@ -522,15 +580,41 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
                 .type_(Some(vote_type.clone()).pack())
                 .build(),
         )
-        .output_data(Bytes::from(vote_data).pack())
+        .output_data(Bytes::from(vote_data.clone()).pack())
         .build();
     let tx = context.complete_tx(tx);
     context.verify_tx(&tx, 20_000_000).unwrap();
 
+    let vote_event_cell = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(500 * CKB)
+            .lock(owner_lock.clone())
+            .type_(Some(vote_type.clone()).pack())
+            .build(),
+        Bytes::from(vote_data),
+    );
+    let consume_vote_event = context.complete_tx(
+        TransactionBuilder::default()
+            .input(
+                CellInput::new_builder()
+                    .previous_output(vote_event_cell)
+                    .build(),
+            )
+            .output(
+                CellOutput::new_builder()
+                    .capacity(500 * CKB)
+                    .lock(owner_lock.clone())
+                    .build(),
+            )
+            .output_data(Bytes::new().pack())
+            .build(),
+    );
+    assert!(context.verify_tx(&consume_vote_event, 20_000_000).is_err());
+
     let wrong_amount_vote_data = VoteData {
         direction: 1,
         amount: dao_capacity - CKB,
-        dao_dep_indices: vec![2],
+        dao_out_points: vec![common_out_point(&dao_cell)],
     }
     .encode()
     .unwrap();
@@ -578,7 +662,7 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
     let forged_vote_data = VoteData {
         direction: 1,
         amount: dao_capacity,
-        dao_dep_indices: vec![2],
+        dao_out_points: vec![common_out_point(&forged_dao_cell)],
     }
     .encode()
     .unwrap();
@@ -614,7 +698,7 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
     let invalid_vote_data = VoteData {
         direction: 1,
         amount: dao_capacity,
-        dao_dep_indices: vec![2],
+        dao_out_points: vec![common_out_point(&dao_cell)],
     }
     .encode()
     .unwrap();
@@ -944,10 +1028,9 @@ fn tally_contract_accepts_builder_generated_final_batch() {
     );
 
     let historical_raw = historical_vote_raw(proposal_id, vote_code_hash, session_lock.clone(), 0);
-    let historical_raw_bytes = historical_raw.as_slice().to_vec();
+    let historical_raws = vec![historical_raw.as_slice().to_vec()];
     let witnesses_root = [0x66; 32];
-    let proven =
-        prove_block_transactions(10, 0, &[historical_raw_bytes], witnesses_root, &[0]).unwrap();
+    let proven = prove_block_transactions(10, 0, &historical_raws, witnesses_root, &[0]).unwrap();
     let raw_tx_hash: [u8; 32] = historical_raw.calc_tx_hash().as_slice().try_into().unwrap();
     let historical_header = HeaderBuilder::default()
         .number(10u64)
@@ -973,7 +1056,7 @@ fn tally_contract_accepts_builder_generated_final_batch() {
         config,
     );
     let input_state = builder.state().clone();
-    let (output_state, batch) = builder
+    let (output_state, mut batch) = builder
         .build_batch(
             &proposal,
             vec![proven],
@@ -982,6 +1065,7 @@ fn tally_contract_accepts_builder_generated_final_batch() {
             proposal.end_block,
         )
         .unwrap();
+    let vote_cell_deps = install_batch_vote_cells(&mut context, &mut batch, &historical_raws, 2);
     assert_eq!(output_state.phase, TallyPhase::Candidate);
     assert_eq!(output_state.yes, 500u128 * CKB as u128);
 
@@ -1008,6 +1092,7 @@ fn tally_contract_accepts_builder_generated_final_batch() {
                     .out_point(config_cell.clone())
                     .build(),
             )
+            .cell_deps(vote_cell_deps.clone())
             .header_dep(historical_header.hash())
             .header_dep(anchor_header.hash())
             .input(
@@ -1165,6 +1250,7 @@ fn build_tally_batch_tx(
         )
         .unwrap();
     mutate(&mut output_state, &mut batch);
+    let vote_cell_deps = install_batch_vote_cells(&mut context, &mut batch, &raw_transactions, 2);
 
     let tally_input = context.create_cell(
         CellOutput::new_builder()
@@ -1182,6 +1268,7 @@ fn build_tally_batch_tx(
     let tx = TransactionBuilder::default()
         .cell_dep(CellDep::new_builder().out_point(proposal_cell).build())
         .cell_dep(CellDep::new_builder().out_point(config_cell).build())
+        .cell_deps(vote_cell_deps)
         .header_dep(historical_header.hash())
         .header_dep(anchor_header.hash())
         .input(
@@ -1226,12 +1313,12 @@ fn benchmark_tally_batch_cycles() {
 #[test]
 fn tally_contract_rejects_malformed_block_multiproofs() {
     let (context, tx, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
-        batch.blocks[0].transactions[1].tx_index = batch.blocks[0].transactions[0].tx_index;
+        batch.blocks[0].events[1].tx_index = batch.blocks[0].events[0].tx_index;
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
     let (context, tx, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
-        batch.blocks[0].transactions.swap(0, 1);
+        batch.blocks[0].events.swap(0, 1);
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
@@ -1252,12 +1339,12 @@ fn tally_contract_rejects_malformed_block_multiproofs() {
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
     let (context, tx, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
-        let raw = RawTransaction::from_slice(&batch.blocks[0].transactions[0].raw_transaction)
+        batch.blocks[0].events[0]
+            .vote
+            .as_mut()
             .unwrap()
-            .as_builder()
-            .version(42u32)
-            .build();
-        batch.blocks[0].transactions[0].raw_transaction = raw.as_slice().to_vec();
+            .vote_cell
+            .tx_hash[0] ^= 1;
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 }
@@ -1288,16 +1375,7 @@ fn tally_contract_rejects_incorrect_output_amount() {
 #[test]
 fn tally_contract_rejects_tampered_proven_vote_amount() {
     let (context, tx, _, _) = build_tally_batch_tx(1, false, 2_000_000, |_, batch| {
-        let proven_vote = &mut batch.blocks[0].transactions[0];
-        let raw = RawTransaction::from_slice(&proven_vote.raw_transaction).unwrap();
-        let output_data = raw.outputs_data().get(0).unwrap().raw_data();
-        let mut vote = VoteData::decode(&output_data).unwrap();
-        vote.amount -= CKB;
-        let tampered = raw
-            .as_builder()
-            .outputs_data([Bytes::from(vote.encode().unwrap())].pack())
-            .build();
-        proven_vote.raw_transaction = tampered.as_slice().to_vec();
+        batch.blocks[0].events[0].vote.as_mut().unwrap().data.amount -= CKB;
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 }
@@ -1306,7 +1384,7 @@ fn tally_contract_rejects_tampered_proven_vote_amount() {
 fn tally_contract_accepts_partial_block_multiproof() {
     let (context, tx, _, _) = build_tally_batch_tx(2, true, 2_000_000, |_, batch| {
         assert!(!batch.blocks[0].lemmas.is_empty());
-        assert_eq!(batch.blocks[0].transactions.len(), 2);
+        assert_eq!(batch.blocks[0].events.len(), 2);
         assert_eq!(batch.blocks[0].tx_count, 4);
     });
     context.verify_tx(&tx, 100_000_000).unwrap();
@@ -1495,7 +1573,16 @@ fn omitted_vote_challenge_slashes_candidate_bond() {
         )
         .build();
     context.insert_header(omitted_header.clone());
-    let challenge = builder.build_omitted_vote_challenge(omitted).unwrap();
+    let mut challenge = builder.build_omitted_vote_challenge(omitted).unwrap();
+    let omitted_raws = vec![omitted_raw.as_slice().to_vec()];
+    let vote_cell_dep = match &mut challenge {
+        TallyWitness::ChallengeVote { omitted, .. } => {
+            let vote = omitted.vote.as_mut().unwrap();
+            vote.cell_dep_index = 2;
+            install_vote_cell(&mut context, vote, &omitted_raws).unwrap()
+        }
+        _ => unreachable!(),
+    };
 
     let bond = 2_000 * CKB;
     let candidate_cell = context.create_cell(
@@ -1529,6 +1616,7 @@ fn omitted_vote_challenge_slashes_candidate_bond() {
                     .out_point(config_cell.clone())
                     .build(),
             )
+            .cell_dep(vote_cell_dep.clone())
             .header_dep(omitted_header.hash())
             .input(
                 CellInput::new_builder()

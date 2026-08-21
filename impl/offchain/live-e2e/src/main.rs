@@ -375,7 +375,7 @@ fn run() -> AnyResult<()> {
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
     let mut rpc = Rpc::new(&endpoint)?;
     rpc.wait_ready()?;
-    println!("V4 live-chain E2E");
+    println!("V5 live-chain E2E");
     println!("  chain directory             {}", run_dir.display());
     println!("  RPC                         {endpoint}");
 
@@ -654,7 +654,7 @@ fn run() -> AnyResult<()> {
         vote2.tx_index,
     )
     .map_err(|error| other(format!("build omitted vote proof: {error:?}")))?;
-    let challenge_witness = map_builder(
+    let mut challenge_witness = map_builder(
         TallyBuilder::build_omitted_vote_challenge_from_candidate(
             proposal_id,
             &closed_proposal,
@@ -668,17 +668,19 @@ fn run() -> AnyResult<()> {
         ),
         "replay candidate and build omitted-vote challenge",
     )?;
+    let mut challenge_deps = vec![
+        code_dep(&code_cells.always),
+        code_dep(&code_cells.tally),
+        code_dep(&closed_proposal_cell.out_point),
+        code_dep(&proposal_config_cell.out_point),
+    ];
+    challenge_deps.extend(vote_event_deps(&mut challenge_witness, 4)?);
     let challenge_tx = transaction(
         vec![
             input(&omitted_candidate_cell.out_point),
             input(&challenger_funding.out_point),
         ],
-        vec![
-            code_dep(&code_cells.always),
-            code_dep(&code_cells.tally),
-            code_dep(&closed_proposal_cell.out_point),
-            code_dep(&proposal_config_cell.out_point),
-        ],
+        challenge_deps,
         vec![omitted_vote_block.block_hash],
         vec![
             output(
@@ -917,7 +919,7 @@ fn run() -> AnyResult<()> {
     let report_path = run_dir.join("report.json");
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("  report                      {}", report_path.display());
-    println!("V4 live-chain E2E PASSED");
+    println!("V5 live-chain E2E PASSED");
     Ok(())
 }
 
@@ -966,7 +968,7 @@ fn write_chain_spec(
          uncles_hash = \"0x0000000000000000000000000000000000000000000000000000000000000000\"\n\
          nonce = \"0x0\"\n\n\
          [genesis.genesis_cell]\n\
-         message = \"CKB Treasury V4 live E2E\"\n\n\
+         message = \"CKB Treasury V5 live E2E\"\n\n\
          [genesis.genesis_cell.lock]\n\
          code_hash = \"0xb35557e7e9854206f7bc13e3c3a7fa4cf8892c84a09237fb0aab40aab3771eee\"\n\
          args = \"0x\"\n\
@@ -1268,7 +1270,7 @@ fn submit_vote(
     let vote_data = VoteData {
         direction: 1,
         amount,
-        dao_dep_indices: vec![4],
+        dao_out_points: vec![common_out_point(&dao.out_point)],
     }
     .encode()
     .map_err(|error| other(format!("encode vote: {error:?}")))?;
@@ -1411,16 +1413,18 @@ fn tally_advance_tx(
     tally_type: &packed::Script,
     output_data: Vec<u8>,
     header_deps: Vec<Hash>,
-    witness: TallyWitness,
+    mut witness: TallyWitness,
 ) -> AnyResult<packed::Transaction> {
+    let mut deps = vec![
+        code_dep(&code.always),
+        code_dep(&code.tally),
+        code_dep(&proposal.out_point),
+        code_dep(&proposal_config.out_point),
+    ];
+    deps.extend(vote_event_deps(&mut witness, 4)?);
     Ok(transaction(
         vec![input(&tally.out_point)],
-        vec![
-            code_dep(&code.always),
-            code_dep(&code.tally),
-            code_dep(&proposal.out_point),
-            code_dep(&proposal_config.out_point),
-        ],
+        deps,
         header_deps,
         vec![output(
             capacity(&tally.output),
@@ -1531,6 +1535,46 @@ fn out_point(hash: Hash, index: u32) -> packed::OutPoint {
         .tx_hash(hash.pack())
         .index(index)
         .build()
+}
+
+fn common_out_point(out_point: &packed::OutPoint) -> OutPoint {
+    OutPoint {
+        tx_hash: packed_hash(&out_point.tx_hash()),
+        index: out_point.index().unpack(),
+    }
+}
+
+fn vote_event_deps(
+    witness: &mut TallyWitness,
+    first_dep_index: u16,
+) -> AnyResult<Vec<packed::CellDep>> {
+    let votes = match witness {
+        TallyWitness::Advance(batch) => batch
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.events)
+            .filter_map(|event| event.vote.as_mut())
+            .collect::<Vec<_>>(),
+        TallyWitness::ChallengeVote { omitted, .. } => omitted.vote.iter_mut().collect(),
+        _ => Vec::new(),
+    };
+    votes
+        .into_iter()
+        .enumerate()
+        .map(|(offset, vote)| {
+            vote.cell_dep_index = first_dep_index
+                .checked_add(
+                    offset
+                        .try_into()
+                        .map_err(|_| other("too many VoteEventCell dependencies"))?,
+                )
+                .ok_or_else(|| other("VoteEventCell dependency index overflow"))?;
+            Ok(code_dep(&out_point(
+                vote.vote_cell.tx_hash,
+                vote.vote_cell.index,
+            )))
+        })
+        .collect()
 }
 
 fn type_id(first_input: &packed::CellInput, output_index: u64) -> Hash {

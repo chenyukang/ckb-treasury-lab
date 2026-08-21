@@ -6,7 +6,7 @@ ckb_std::default_alloc!(16384, 1258306, 64);
 
 use ckb_std::{
     ckb_constants::Source,
-    ckb_types::prelude::Entity,
+    ckb_types::prelude::{Entity, Unpack},
     high_level::{
         QueryIter, load_cell_capacity, load_cell_data, load_cell_lock_hash, load_cell_type,
         load_cell_type_hash, load_input_out_point, load_script, load_transaction,
@@ -31,6 +31,8 @@ enum Error {
     ConfigNotFound,
     ConfigInvalid,
     ContractIdentityMismatch,
+    EventImmutable,
+    DepGroupUnsupported,
 }
 
 pub fn program_entry() -> i8 {
@@ -45,9 +47,10 @@ fn run() -> Result<(), Error> {
     let args = script.args().raw_data();
     let proposal_type_hash: [u8; 32] = args.as_ref().try_into().map_err(|_| Error::ArgsInvalid)?;
 
+    let input_count = QueryIter::new(load_cell_type_hash, Source::GroupInput).count();
     let output_count = QueryIter::new(load_cell_type_hash, Source::GroupOutput).count();
-    if output_count == 0 {
-        return Ok(());
+    if input_count != 0 {
+        return Err(Error::EventImmutable);
     }
     if output_count != 1 {
         return Err(Error::MultipleVoteOutputs);
@@ -69,7 +72,7 @@ fn run() -> Result<(), Error> {
 
     let vote_data = load_cell_data(0, Source::GroupOutput).map_err(|_| Error::VoteDataInvalid)?;
     let vote = VoteData::decode(&vote_data).map_err(|_| Error::VoteDataInvalid)?;
-    if vote.dao_dep_indices.len() > proposal.max_dao_deps_per_vote as usize {
+    if vote.dao_out_points.len() > proposal.max_dao_deps_per_vote as usize {
         return Err(Error::VoteDataInvalid);
     }
 
@@ -77,18 +80,27 @@ fn run() -> Result<(), Error> {
     let cell_deps = transaction.raw().cell_deps();
     let spent_out_points =
         QueryIter::new(load_input_out_point, Source::Input).collect::<alloc::vec::Vec<_>>();
-    let mut previous_index = None;
+    let mut previous_out_point = None;
     let mut total_capacity = 0u64;
-    for dep_index in vote.dao_dep_indices {
-        if previous_index.is_some_and(|previous| dep_index <= previous) {
+    for dao_out_point in vote.dao_out_points {
+        if previous_out_point.is_some_and(|previous| dao_out_point <= previous) {
             return Err(Error::DuplicateDaoDep);
         }
-        previous_index = Some(dep_index);
-        let dep_index = dep_index as usize;
-        let dep_out_point = cell_deps
-            .get(dep_index)
-            .ok_or(Error::DaoDepInvalid)?
-            .out_point();
+        previous_out_point = Some(dao_out_point);
+        let dep_index = cell_deps
+            .clone()
+            .into_iter()
+            .position(|cell_dep| unpack_out_point(&cell_dep.out_point()) == dao_out_point)
+            .ok_or(Error::DaoDepInvalid)?;
+        if cell_deps
+            .clone()
+            .into_iter()
+            .take(dep_index + 1)
+            .any(|cell_dep| cell_dep.dep_type().as_slice()[0] != 0)
+        {
+            return Err(Error::DepGroupUnsupported);
+        }
+        let dep_out_point = cell_deps.get(dep_index).unwrap().out_point();
         if spent_out_points.contains(&dep_out_point) {
             return Err(Error::DaoSpentInVote);
         }
@@ -129,6 +141,13 @@ fn run() -> Result<(), Error> {
         return Err(Error::AmountBelowMinimum);
     }
     Ok(())
+}
+
+fn unpack_out_point(out_point: &ckb_std::ckb_types::packed::OutPoint) -> treasury_common::OutPoint {
+    treasury_common::OutPoint {
+        tx_hash: out_point.tx_hash().as_slice().try_into().unwrap(),
+        index: out_point.index().unpack(),
+    }
 }
 
 fn load_proposal_config(config_type_hash: [u8; 32]) -> Result<ProposalConfig, Error> {

@@ -1,6 +1,6 @@
-# V4 live-chain E2E
+# V5 live-chain E2E
 
-This runner starts an isolated Dummy-PoW CKB node and executes the current V4
+This runner starts an isolated Dummy-PoW CKB node and executes the current V5
 Treasury voting lifecycle against real RPC, tx-pool, block assembly, and block
 verification paths.
 
@@ -19,6 +19,7 @@ The scenario covers:
 
 - consensus-created Treasury Cells;
 - DAO deposits, proposal creation/closing, and on-chain votes;
+- compact VoteEventCell position proofs with raw DAO-spend support;
 - an incomplete final tally candidate slashed by an omitted-vote challenge;
 - a complete candidate finalized after its challenge period; and
 - Result Cell plus Treasury Cell consumption producing the requested payout.
