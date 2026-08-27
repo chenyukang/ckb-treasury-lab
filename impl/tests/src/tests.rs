@@ -542,6 +542,18 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
             .build(),
         Bytes::from(vec![0; 8]),
     );
+    let dao_header = HeaderBuilder::default()
+        .number(10u64)
+        .epoch(EpochNumberWithFraction::new(0, 10, 100))
+        .build();
+    let proposal_header = HeaderBuilder::default()
+        .number(20u64)
+        .epoch(EpochNumberWithFraction::new(0, 20, 100))
+        .build();
+    context.insert_header(dao_header.clone());
+    context.insert_header(proposal_header.clone());
+    context.link_cell_with_block(dao_cell.clone(), dao_header.hash(), 1);
+    context.link_cell_with_block(proposal_cell.clone(), proposal_header.hash(), 1);
     let owner_input = context.create_cell(
         CellOutput::new_builder()
             .capacity(600 * CKB)
@@ -568,6 +580,8 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
                 .build(),
         )
         .cell_dep(CellDep::new_builder().out_point(dao_cell.clone()).build())
+        .header_dep(dao_header.hash())
+        .header_dep(proposal_header.hash())
         .input(
             CellInput::new_builder()
                 .previous_output(owner_input.clone())
@@ -584,6 +598,40 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
         .build();
     let tx = context.complete_tx(tx);
     context.verify_tx(&tx, 20_000_000).unwrap();
+
+    let missing_dao_header = tx
+        .as_advanced_builder()
+        .set_header_deps(vec![proposal_header.hash()])
+        .build();
+    let error = context
+        .verify_tx(&missing_dao_header, 20_000_000)
+        .unwrap_err();
+    let debug = format!("{error:?}");
+    assert!(debug.contains("error code 19"), "{debug}");
+
+    context.link_cell_with_block(dao_cell.clone(), proposal_header.hash(), 2);
+    let same_block_dao = tx
+        .as_advanced_builder()
+        .set_header_deps(vec![proposal_header.hash()])
+        .build();
+    let error = context.verify_tx(&same_block_dao, 20_000_000).unwrap_err();
+    let debug = format!("{error:?}");
+    assert!(debug.contains("error code 20"), "{debug}");
+
+    let newer_dao_header = HeaderBuilder::default()
+        .number(21u64)
+        .epoch(EpochNumberWithFraction::new(0, 21, 100))
+        .build();
+    context.insert_header(newer_dao_header.clone());
+    context.link_cell_with_block(dao_cell.clone(), newer_dao_header.hash(), 1);
+    let newer_dao = tx
+        .as_advanced_builder()
+        .set_header_deps(vec![proposal_header.hash(), newer_dao_header.hash()])
+        .build();
+    let error = context.verify_tx(&newer_dao, 20_000_000).unwrap_err();
+    let debug = format!("{error:?}");
+    assert!(debug.contains("error code 20"), "{debug}");
+    context.link_cell_with_block(dao_cell.clone(), dao_header.hash(), 1);
 
     let vote_event_cell = context.create_cell(
         CellOutput::new_builder()
@@ -630,6 +678,8 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
                 .build(),
         )
         .cell_dep(CellDep::new_builder().out_point(dao_cell.clone()).build())
+        .header_dep(dao_header.hash())
+        .header_dep(proposal_header.hash())
         .input(
             CellInput::new_builder()
                 .previous_output(owner_input.clone())
@@ -659,6 +709,7 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
             .build(),
         Bytes::from(vec![0; 8]),
     );
+    context.link_cell_with_block(forged_dao_cell.clone(), dao_header.hash(), 2);
     let forged_vote_data = VoteData {
         direction: 1,
         amount: dao_capacity,
@@ -678,6 +729,8 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
                 .build(),
         )
         .cell_dep(CellDep::new_builder().out_point(forged_dao_cell).build())
+        .header_dep(dao_header.hash())
+        .header_dep(proposal_header.hash())
         .input(
             CellInput::new_builder()
                 .previous_output(owner_input)
@@ -706,6 +759,8 @@ fn vote_contract_validates_configured_dao_type_and_amount() {
         .cell_dep(CellDep::new_builder().out_point(proposal_cell).build())
         .cell_dep(CellDep::new_builder().out_point(config_cell).build())
         .cell_dep(CellDep::new_builder().out_point(dao_cell.clone()).build())
+        .header_dep(dao_header.hash())
+        .header_dep(proposal_header.hash())
         .input(CellInput::new_builder().previous_output(dao_cell).build())
         .output(
             CellOutput::new_builder()

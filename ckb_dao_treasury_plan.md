@@ -1,6 +1,43 @@
 # CKB DAO Treasury Implementation Plan
 
-Last updated: 2026-08-21
+Last updated: 2026-08-27
+
+## DAO Deposit Age Validation (2026-08-27)
+
+### Objective
+
+Require every DAO deposit referenced by a VoteEventCell to have been created in
+a block strictly earlier than the block that created the Proposal Cell. The
+Vote transaction supplies both creation headers as HeaderDeps; the Vote Type
+Script loads the headers through the resolved CellDeps and compares their block
+numbers. No raw creation transaction or transaction-position proof is needed.
+
+### Steps
+
+- [x] Verify that CKB exposes a CellDep's creation header when its block hash is
+  present in the transaction's HeaderDeps.
+- [x] Add the strict DAO creation block check to the Vote Type Script.
+- [x] Add contract tests for older, same-block, newer, and missing-header DAO
+  deposits.
+- [x] Update the live-chain E2E transaction builder and add a rejected late-DAO
+  vote before the successful voting and settlement flow.
+- [x] Rebuild all contract binaries and run formatting, Clippy, and the full
+  Rust/contract test suite.
+- [x] Deploy the rebuilt binaries to a fresh local CKB chain and rerun the full
+  live-chain E2E.
+
+### Validation
+
+- The clean release build, formatting check, full Clippy run, 39 standard
+  Rust/CKB-VM tests, and the ignored cycle benchmark passed.
+- The rebuilt Vote Type Script is 72,544 bytes and has CKB data hash
+  `0x15ab76603782b78b5600b9874754c000a081dc9c9e6d9178ffaf1a946b545020`.
+- A fresh local CKB chain deployed the rebuilt binaries as genesis system cells.
+  DAO deposits from blocks 20 and 24 could vote on the Proposal from block 28;
+  a DAO deposit from block 32 was rejected with Vote script error code 20.
+- The remaining omitted-vote challenge, complete tally, finalization, and
+  Treasury payout flow passed. Report:
+  `impl/target/live-e2e/1787804454-33060/report.json`.
 
 ## Objective
 

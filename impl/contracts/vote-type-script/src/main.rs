@@ -9,7 +9,7 @@ use ckb_std::{
     ckb_types::prelude::{Entity, Unpack},
     high_level::{
         QueryIter, load_cell_capacity, load_cell_data, load_cell_lock_hash, load_cell_type,
-        load_cell_type_hash, load_input_out_point, load_script, load_transaction,
+        load_cell_type_hash, load_header, load_input_out_point, load_script, load_transaction,
     },
 };
 use treasury_common::{ProposalConfig, ProposalData, ProposalPhase, VoteData};
@@ -33,6 +33,9 @@ enum Error {
     ContractIdentityMismatch,
     EventImmutable,
     DepGroupUnsupported,
+    ProposalCreationHeaderMissing,
+    DaoCreationHeaderMissing,
+    DaoDepositTooNew,
 }
 
 pub fn program_entry() -> i8 {
@@ -56,12 +59,17 @@ fn run() -> Result<(), Error> {
         return Err(Error::MultipleVoteOutputs);
     }
 
-    let (proposal, config) = find_open_proposal(proposal_type_hash)?;
+    let (proposal_dep_index, proposal, config) = find_open_proposal(proposal_type_hash)?;
     if script.code_hash().as_slice() != config.vote_code_hash
         || script.hash_type().as_slice()[0] != config.vote_hash_type
     {
         return Err(Error::ContractIdentityMismatch);
     }
+    let proposal_creation_block: u64 = load_header(proposal_dep_index, Source::CellDep)
+        .map_err(|_| Error::ProposalCreationHeaderMissing)?
+        .raw()
+        .number()
+        .unpack();
     let vote_lock_hash =
         load_cell_lock_hash(0, Source::GroupOutput).map_err(|_| Error::VoteDataInvalid)?;
     if !QueryIter::new(load_cell_lock_hash, Source::Input)
@@ -127,6 +135,15 @@ fn run() -> Result<(), Error> {
             return Err(Error::DaoDepInvalid);
         }
 
+        let dao_creation_block: u64 = load_header(dep_index, Source::CellDep)
+            .map_err(|_| Error::DaoCreationHeaderMissing)?
+            .raw()
+            .number()
+            .unpack();
+        if dao_creation_block >= proposal_creation_block {
+            return Err(Error::DaoDepositTooNew);
+        }
+
         total_capacity = total_capacity
             .checked_add(
                 load_cell_capacity(dep_index, Source::CellDep).map_err(|_| Error::DaoDepInvalid)?,
@@ -162,7 +179,7 @@ fn load_proposal_config(config_type_hash: [u8; 32]) -> Result<ProposalConfig, Er
 
 fn find_open_proposal(
     proposal_type_hash: [u8; 32],
-) -> Result<(ProposalData, ProposalConfig), Error> {
+) -> Result<(usize, ProposalData, ProposalConfig), Error> {
     for (index, type_hash) in QueryIter::new(load_cell_type_hash, Source::CellDep).enumerate() {
         if type_hash == Some(proposal_type_hash) {
             let type_script = load_cell_type(index, Source::CellDep)
@@ -180,7 +197,7 @@ fn find_open_proposal(
             {
                 return Err(Error::ContractIdentityMismatch);
             }
-            return Ok((proposal, config));
+            return Ok((index, proposal, config));
         }
     }
     Err(Error::ProposalNotFound)

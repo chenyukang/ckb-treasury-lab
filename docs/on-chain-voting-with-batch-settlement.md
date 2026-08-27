@@ -138,6 +138,22 @@ permissionless at both the lock and type-script layers. Competing operators may
 create independent sessions, but only one can consume the singleton Closed
 Proposal during finalization.
 
+## Vote eligibility
+
+A Vote transaction references the live Proposal Cell and every DAO deposit as
+direct CellDeps. It also includes the blocks that created those cells as
+HeaderDeps. The Vote Type Script loads the creation header associated with each
+resolved CellDep and requires:
+
+```text
+dao_deposit_creation_block < proposal_creation_block
+```
+
+Deposits created in the Proposal's block or any later block are ineligible. A
+missing creation HeaderDep also makes the vote invalid. This authenticates Cell
+age without carrying either creation transaction in the witness; the node binds
+each resolved CellDep to its actual creation block through `transaction_info`.
+
 ## Batch witness verification
 
 A batch contains only relevant historical events: compact VoteEvent proofs and
@@ -311,6 +327,8 @@ input Cell's actual creation point and naturally resets for Treasury change.
 - `ckb-testtool` rejects duplicate or unsorted transaction indices, added or
   removed CBMT lemmas, wrong block headers, and modified RawTransactions.
 - `ckb-testtool` executes a builder-generated final batch in CKB-VM.
+- `ckb-testtool` accepts DAO deposits older than the Proposal and rejects
+  missing creation headers plus same-block and newer deposits.
 - `ckb-testtool` executes an omitted-vote challenge and bond slash.
 - `ckb-testtool` executes exact Treasury payout and expired burn paths.
 - CKB node tests cover activation, issuance decomposition, derived-state replay,
@@ -318,12 +336,13 @@ input Cell's actual creation point and naturally resets for Treasury change.
 - The reproducible `live-e2e` runner starts the current Treasury-enabled CKB
   binary and submits real transactions through RPC, tx-pool, proposal, block
   assembly, and block verification. It mines DAO deposits, an open/closed
-  proposal, and VoteTxs; accepts and then slashes an omitted-vote candidate;
+  proposal, rejects a post-Proposal DAO deposit at VoteTx verification, and
+  accepts eligible VoteTxs; accepts and then slashes an omitted-vote candidate;
   accepts the complete candidate; finalizes a passed Result Cell; and consumes a
   consensus-created Treasury Cell for payout.
 - In the validated run, the incomplete candidate and challenge committed in
   blocks 56 and 60. The complete candidate, finalization, and payout committed in
-  blocks 68, 72, and 76. The tally was 2,100 CKB YES and 0 NO; the payout sent
+  blocks 68, 77, and 81. The tally was 2,100 CKB YES and 0 NO; the payout sent
   100 CKB and preserved the exact Treasury change.
 - The RPC adapter accepts both current 5-field Molecule `BlockV1` responses and
   legacy 4-field `Block` responses, and verifies their transaction roots before

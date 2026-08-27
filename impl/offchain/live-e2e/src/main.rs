@@ -407,6 +407,7 @@ fn run() -> AnyResult<()> {
     let proposer_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x01]);
     let voter1_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x11]);
     let voter2_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x12]);
+    let late_voter_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x13]);
     let operator_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x21]);
     let challenger_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x22]);
     let receiver_lock = script(always_code_hash, DATA_HASH_TYPE, &[0x31]);
@@ -416,6 +417,8 @@ fn run() -> AnyResult<()> {
     let vote1_funding = find_cell(&cells, &voter1_lock, 500 * CKB)?;
     let dao2_funding = find_cell(&cells, &voter2_lock, 1_100 * CKB)?;
     let vote2_funding = find_cell(&cells, &voter2_lock, 500 * CKB)?;
+    let late_dao_funding = find_cell(&cells, &late_voter_lock, 600 * CKB)?;
+    let late_vote_funding = find_cell(&cells, &late_voter_lock, 550 * CKB)?;
     let omitted_bond_funding = find_cell(&cells, &operator_lock, 5_000 * CKB)?;
     let complete_bond_funding = find_cell(&cells, &operator_lock, 5_100 * CKB)?;
     let operator_auth_funding = find_cell(&cells, &operator_lock, 100 * CKB)?;
@@ -531,12 +534,55 @@ fn run() -> AnyResult<()> {
         open_proposal.encode(),
     );
 
+    let late_dao = rpc.commit(
+        "DAO deposit after proposal",
+        simple_transfer(
+            &late_dao_funding,
+            &late_voter_lock,
+            Some(dao_type.clone()),
+            Bytes::from(vec![0; 8]),
+            vec![code_dep(&code_cells.always), code_dep(&code_cells.dao)],
+        ),
+    )?;
+    let late_dao_cell = output_cell(
+        &late_dao,
+        0,
+        600 * CKB,
+        &late_voter_lock,
+        Some(&dao_type),
+        vec![0; 8],
+    );
+
     rpc.mine_to(start_block)?;
     let vote_type = script(
         *code_hashes.get("vote").unwrap(),
         DATA1_HASH_TYPE,
         &proposal_id,
     );
+    let proposal_creation_header = rpc.block_hash(proposal_commit.block_number)?;
+    let late_dao_header = rpc.block_hash(late_dao.block_number)?;
+    let late_vote_tx = vote_transaction(
+        &code_cells,
+        &late_vote_funding,
+        &late_voter_lock,
+        &vote_type,
+        &open_proposal_cell,
+        &proposal_config_cell,
+        &late_dao_cell,
+        600 * CKB,
+        vec![proposal_creation_header, late_dao_header],
+    )?;
+    let late_vote_rejection = rpc
+        .submit(late_vote_tx)
+        .expect_err("a DAO deposit created after its proposal must not vote");
+    if !late_vote_rejection.to_string().contains("error code 20") {
+        return Err(other(format!(
+            "late DAO vote failed for an unexpected reason: {late_vote_rejection}"
+        )));
+    }
+    println!("  late DAO vote              rejected with error code 20");
+
+    let dao1_header = rpc.block_hash(dao1.block_number)?;
     let vote1 = submit_vote(
         &mut rpc,
         "vote yes voter 1",
@@ -548,7 +594,9 @@ fn run() -> AnyResult<()> {
         &proposal_config_cell,
         &dao1_cell,
         1_000 * CKB,
+        vec![proposal_creation_header, dao1_header],
     )?;
+    let dao2_header = rpc.block_hash(dao2.block_number)?;
     let vote2 = submit_vote(
         &mut rpc,
         "vote yes voter 2",
@@ -560,6 +608,7 @@ fn run() -> AnyResult<()> {
         &proposal_config_cell,
         &dao2_cell,
         1_100 * CKB,
+        vec![proposal_creation_header, dao2_header],
     )?;
     if vote1.block_number > end_block || vote2.block_number > end_block {
         return Err(other("a vote was committed after the voting window"));
@@ -897,6 +946,7 @@ fn run() -> AnyResult<()> {
         "transactions": {
             "dao_deposit_1": commit_json(&dao1),
             "dao_deposit_2": commit_json(&dao2),
+            "late_dao_deposit": commit_json(&late_dao),
             "proposal": commit_json(&proposal_commit),
             "vote_1": commit_json(&vote1),
             "vote_2": commit_json(&vote2),
@@ -909,6 +959,7 @@ fn run() -> AnyResult<()> {
         },
         "assertions": [
             "Treasury Cell was created by a mined Cellbase transaction",
+            "a DAO deposit created after the Proposal Cell was rejected for voting",
             "omitted-vote candidate was accepted and then consumed by a valid challenge",
             "complete tally counted both DAO deposits",
             "policy produced a passed Result Cell",
@@ -1037,6 +1088,8 @@ fn write_chain_spec(
         (500 * CKB, 0x11),
         (1_100 * CKB, 0x12),
         (500 * CKB, 0x12),
+        (600 * CKB, 0x13),
+        (550 * CKB, 0x13),
         (5_000 * CKB, 0x21),
         (5_100 * CKB, 0x21),
         (100 * CKB, 0x21),
@@ -1266,7 +1319,34 @@ fn submit_vote(
     proposal_config: &CellRef,
     dao: &CellRef,
     amount: u64,
+    headers: Vec<Hash>,
 ) -> AnyResult<Commit> {
+    let tx = vote_transaction(
+        code,
+        funding,
+        voter_lock,
+        vote_type,
+        proposal,
+        proposal_config,
+        dao,
+        amount,
+        headers,
+    )?;
+    rpc.commit(label, tx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vote_transaction(
+    code: &CodeCells,
+    funding: &CellRef,
+    voter_lock: &packed::Script,
+    vote_type: &packed::Script,
+    proposal: &CellRef,
+    proposal_config: &CellRef,
+    dao: &CellRef,
+    amount: u64,
+    headers: Vec<Hash>,
+) -> AnyResult<packed::Transaction> {
     let vote_data = VoteData {
         direction: 1,
         amount,
@@ -1274,7 +1354,7 @@ fn submit_vote(
     }
     .encode()
     .map_err(|error| other(format!("encode vote: {error:?}")))?;
-    let tx = transaction(
+    Ok(transaction(
         vec![input(&funding.out_point)],
         vec![
             code_dep(&code.always),
@@ -1283,7 +1363,7 @@ fn submit_vote(
             code_dep(&proposal_config.out_point),
             code_dep(&dao.out_point),
         ],
-        vec![],
+        headers,
         vec![output(
             capacity(&funding.output),
             voter_lock,
@@ -1291,8 +1371,7 @@ fn submit_vote(
         )],
         vec![Bytes::from(vote_data)],
         vec![],
-    );
-    rpc.commit(label, tx)
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
