@@ -9,10 +9,9 @@ use sparse_merkle_tree::{
     H256, SparseMerkleTree, blake2b::Blake2bHasher, default_store::DefaultStore,
 };
 use treasury_common::{
-    BatchWitness, DAO_STATE_NAMESPACE, EVENT_PRESENT, EVENT_STATE_NAMESPACE, Hash, LeafTransition,
-    MergeHash, OutPoint, ProposalConfig, ProposalData, ProvenBlock, ProvenBlockEvent,
-    ProvenTransaction, ProvenVote, TallyPhase, TallyState, VOTE_STATE_NAMESPACE, VoteData,
-    VoteRecord, namespaced_state_key,
+    BatchWitness, EVENT_PRESENT, EVENT_STATE_NAMESPACE, Hash, LeafTransition, MergeHash, OutPoint,
+    ProposalConfig, ProposalData, ProvenBlock, ProvenBlockEvent, ProvenTransaction, ProvenVote,
+    TallyPhase, TallyState, VOTE_STATE_NAMESPACE, VoteData, VoteRecord, namespaced_state_key,
 };
 
 mod rpc;
@@ -125,9 +124,7 @@ impl TallyBuilder {
                 sequence: 0,
                 next_block: start_block,
                 next_tx_index: 0,
-                votes_root: ZERO,
-                dao_root: ZERO,
-                events_root: ZERO,
+                state_root: ZERO,
                 yes: 0,
                 no: 0,
                 processed_events: 0,
@@ -142,8 +139,8 @@ impl TallyBuilder {
         &self.state
     }
 
-    /// Scans one ordered block and returns exactly the vote and tracked-DAO-spend
-    /// transactions that must be included in the next batch.
+    /// Scans one ordered block and returns exactly the vote transactions that
+    /// must be included in the next batch.
     pub fn discover_block_events(
         &self,
         proposal: &ProposalData,
@@ -442,9 +439,7 @@ impl TallyBuilder {
             .checked_add(event_count as u64)
             .ok_or(BuilderError::TallyOverflow)?;
         let committed_root = root(&next.committed_state);
-        next.state.votes_root = committed_root;
-        next.state.dao_root = committed_root;
-        next.state.events_root = committed_root;
+        next.state.state_root = committed_root;
         next.state.candidate_since = if next.state.phase == TallyPhase::Candidate {
             if candidate_since < proposal.end_block {
                 return Err(BuilderError::CursorInvalid);
@@ -569,20 +564,6 @@ impl TallyBuilder {
             .map_err(Into::into)
     }
 
-    pub fn build_omitted_spend_challenge_from_candidate<S: TransactionSource>(
-        proposal_id: Hash,
-        proposal: &ProposalData,
-        config: ProposalConfig,
-        source: &S,
-        candidate_out_point: OutPoint,
-        omitted_spend: ProvenTransaction,
-        dao_out_point: OutPoint,
-    ) -> Result<treasury_common::TallyWitness, ReplayError<S::Error>> {
-        Self::replay_candidate(proposal_id, proposal, config, source, candidate_out_point)?
-            .build_omitted_spend_challenge(omitted_spend, dao_out_point)
-            .map_err(Into::into)
-    }
-
     pub fn build_omitted_vote_challenge(
         &self,
         mut omitted: ProvenTransaction,
@@ -600,39 +581,6 @@ impl TallyBuilder {
         Ok(treasury_common::TallyWitness::ChallengeVote {
             omitted,
             event_proof: compiled_proof(&self.committed_state, &keys)?,
-        })
-    }
-
-    pub fn build_omitted_spend_challenge(
-        &self,
-        omitted_spend: ProvenTransaction,
-        dao_out_point: OutPoint,
-    ) -> Result<treasury_common::TallyWitness, BuilderError> {
-        let raw = RawTransaction::from_slice(&omitted_spend.raw_transaction)
-            .map_err(|_| BuilderError::InvalidEvent)?;
-        if !raw
-            .inputs()
-            .into_iter()
-            .any(|input| unpack_out_point(&input.previous_output()) == dao_out_point)
-        {
-            return Err(BuilderError::InvalidEvent);
-        }
-        let spend_hash: Hash = raw.calc_tx_hash().as_slice().try_into().unwrap();
-        let event_key = state_key(EVENT_STATE_NAMESPACE, spend_hash);
-        if value(&self.committed_state, event_key)? != ZERO {
-            return Err(BuilderError::InvalidEvent);
-        }
-        let dao_key = state_key(DAO_STATE_NAMESPACE, dao_out_point.key());
-        let voter_lock_hash = value(&self.committed_state, dao_key)?;
-        if voter_lock_hash == ZERO {
-            return Err(BuilderError::InvalidState);
-        }
-        Ok(treasury_common::TallyWitness::ChallengeSpend {
-            omitted_spend,
-            dao_out_point,
-            voter_lock_hash,
-            event_proof: compiled_proof(&self.committed_state, &BTreeSet::from([event_key]))?,
-            dao_proof: compiled_proof(&self.committed_state, &BTreeSet::from([dao_key]))?,
         })
     }
 
@@ -685,6 +633,7 @@ impl TallyBuilder {
             (None, Some(vote)) => vote.vote_cell.tx_hash,
             (None, None) => return Err(BuilderError::InvalidEvent),
         };
+        let vote = event.vote.as_ref().ok_or(BuilderError::InvalidEvent)?;
         let event_key = state_key(EVENT_STATE_NAMESPACE, tx_hash);
         if value(&self.committed_state, event_key)? != ZERO {
             return Err(BuilderError::InvalidEvent);
@@ -692,60 +641,22 @@ impl TallyBuilder {
         state_keys.insert(event_key);
         update(&mut self.committed_state, event_key, EVENT_PRESENT)?;
 
-        let spent_out_points = raw
-            .as_ref()
-            .map(|raw| {
-                raw.inputs()
-                    .into_iter()
-                    .map(|input| unpack_out_point(&input.previous_output()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let mut relevant = false;
-        let mut has_tracked_spend = false;
-        for out_point in &spent_out_points {
-            let key = state_key(DAO_STATE_NAMESPACE, out_point.key());
-            let voter = value(&self.committed_state, key)?;
-            if voter != ZERO {
-                self.remove_record(voter, vote_keys, state_keys)?;
-                relevant = true;
-                has_tracked_spend = true;
-            }
+        if vote.data.dao_out_points.len() > proposal.max_dao_deps_per_vote as usize {
+            return Err(BuilderError::BatchLimit);
         }
-        if let Some(vote) = &event.vote {
-            if vote.data.dao_out_points.len() > proposal.max_dao_deps_per_vote as usize {
-                return Err(BuilderError::BatchLimit);
-            }
-            if vote
-                .data
-                .dao_out_points
-                .iter()
-                .any(|out_point| spent_out_points.contains(out_point))
-            {
-                return Err(BuilderError::InvalidEvent);
-            }
-            self.apply_record(
-                VoteRecord {
-                    voter_lock_hash: vote.voter_lock_hash,
-                    direction: vote.data.direction,
-                    amount: vote.data.amount,
-                    block_number,
-                    tx_index: event.tx_index,
-                    dao_out_points: vote.data.dao_out_points.clone(),
-                },
-                vote_keys,
-                state_keys,
-            )?;
-            relevant = true;
-        }
-        if relevant {
-            if event.vote.is_some() && !has_tracked_spend {
-                event.raw_transaction.clear();
-            }
-            Ok(())
-        } else {
-            Err(BuilderError::InvalidEvent)
-        }
+        self.apply_record(
+            VoteRecord {
+                voter_lock_hash: vote.voter_lock_hash,
+                direction: vote.data.direction,
+                amount: vote.data.amount,
+                block_number,
+                tx_index: event.tx_index,
+            },
+            vote_keys,
+            state_keys,
+        )?;
+        event.raw_transaction.clear();
+        Ok(())
     }
 
     fn extract_vote_optional(
@@ -800,15 +711,6 @@ impl TallyBuilder {
     }
 
     fn is_relevant(&self, raw: &RawTransaction) -> Result<bool, BuilderError> {
-        for input in raw.inputs().into_iter() {
-            let dao_key = state_key(
-                DAO_STATE_NAMESPACE,
-                unpack_out_point(&input.previous_output()).key(),
-            );
-            if value(&self.committed_state, dao_key)? != ZERO {
-                return Ok(true);
-            }
-        }
         Ok(raw.outputs().into_iter().any(|output| {
             output.type_().to_opt().is_some_and(|script| {
                 script.code_hash().as_slice() == self.config.vote_code_hash
@@ -833,14 +735,6 @@ impl TallyBuilder {
             .ok_or(BuilderError::MissingStateKey)?;
         update(&mut self.committed_state, vote_key, ZERO)?;
         self.subtract_tally(record.direction, record.amount)?;
-        for out_point in record.dao_out_points {
-            let key = state_key(DAO_STATE_NAMESPACE, out_point.key());
-            state_keys.insert(key);
-            if value(&self.committed_state, key)? != voter {
-                return Err(BuilderError::InvalidState);
-            }
-            update(&mut self.committed_state, key, ZERO)?;
-        }
         Ok(())
     }
 
@@ -856,14 +750,6 @@ impl TallyBuilder {
         state_keys.insert(vote_key);
         if value(&self.committed_state, vote_key)? != ZERO {
             self.remove_record(voter, vote_keys, state_keys)?;
-        }
-        for out_point in &record.dao_out_points {
-            let key = state_key(DAO_STATE_NAMESPACE, out_point.key());
-            state_keys.insert(key);
-            if value(&self.committed_state, key)? != ZERO {
-                return Err(BuilderError::InvalidState);
-            }
-            update(&mut self.committed_state, key, voter)?;
         }
         self.add_tally(record.direction, record.amount)?;
         let record_hash = record.value_hash().map_err(|_| BuilderError::Encoding)?;
@@ -1388,7 +1274,7 @@ mod tests {
         let proposal = proposal();
         let builder = TallyBuilder::new([7; 32], [8; 32], proposal.start_block, proposal_config());
         assert_eq!(builder.state().next_block, proposal.start_block);
-        assert_eq!(builder.state().votes_root, ZERO);
+        assert_eq!(builder.state().state_root, ZERO);
     }
 
     #[test]
@@ -1406,14 +1292,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state.phase, TallyPhase::Candidate);
-        assert_eq!(state.votes_root, ZERO);
+        assert_eq!(state.state_root, ZERO);
         assert_eq!(state.yes, 0);
         assert!(batch.state_transitions.is_empty());
         assert!(batch.state_proof.is_empty());
     }
 
     #[test]
-    fn scanner_carries_vote_state_across_blocks() {
+    fn scanner_ignores_dao_spend_after_vote() {
         let mut proposal = proposal();
         proposal.end_block = 11;
         let proposal_id = [7; 32];
@@ -1445,8 +1331,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(scanned.blocks.len(), 2);
-        assert_eq!(scanned.blocks[1].header_dep_index, 1);
+        assert_eq!(scanned.blocks.len(), 1);
         assert_eq!(scanned.header_deps, vec![[10; 32], [11; 32]]);
         assert_eq!((scanned.end_block, scanned.end_tx_index), (12, 0));
 
@@ -1462,69 +1347,9 @@ mod tests {
             .unwrap();
         assert!(batch.blocks[0].events[0].raw_transaction.is_empty());
         assert!(batch.blocks[0].events[0].vote.is_some());
-        assert!(!batch.blocks[1].events[0].raw_transaction.is_empty());
-        assert!(batch.blocks[1].events[0].vote.is_none());
         assert_eq!(candidate.phase, TallyPhase::Candidate);
-        assert_eq!(candidate.yes, 0);
-    }
-
-    #[test]
-    fn spend_challenge_requires_candidate_to_claim_dao_is_live() {
-        let mut proposal = proposal();
-        proposal.end_block = 11;
-        let proposal_id = [7; 32];
-        let (vote_raw, spend_raw) = vote_and_spend_transactions(proposal_id);
-        let vote_block = prove_block_transactions(10, 0, &[vote_raw], [20; 32], &[0]).unwrap();
-        let spend_block =
-            prove_block_transactions(11, 1, core::slice::from_ref(&spend_raw), [21; 32], &[0])
-                .unwrap();
-        let spend = prove_transaction(11, 1, &[spend_raw], [21; 32], 0).unwrap();
-        let dao_out_point = OutPoint {
-            tx_hash: [9; 32],
-            index: 0,
-        };
-
-        let mut omitted_builder = TallyBuilder::new(
-            proposal_id,
-            [8; 32],
-            proposal.start_block,
-            proposal_config(),
-        );
-        omitted_builder
-            .build_batch(
-                &proposal,
-                vec![vote_block.clone()],
-                proposal.end_block + 1,
-                0,
-                proposal.end_block,
-            )
-            .unwrap();
-        assert!(
-            omitted_builder
-                .build_omitted_spend_challenge(spend.clone(), dao_out_point)
-                .is_ok()
-        );
-
-        let mut complete_builder = TallyBuilder::new(
-            proposal_id,
-            [8; 32],
-            proposal.start_block,
-            proposal_config(),
-        );
-        complete_builder
-            .build_batch(
-                &proposal,
-                vec![vote_block, spend_block],
-                proposal.end_block + 1,
-                0,
-                proposal.end_block,
-            )
-            .unwrap();
-        assert!(
-            complete_builder
-                .build_omitted_spend_challenge(spend, dao_out_point)
-                .is_err()
-        );
+        assert_eq!(candidate.yes, 100);
+        assert_eq!(candidate.processed_events, 1);
     }
 
     #[test]
@@ -1538,7 +1363,7 @@ mod tests {
             .hash_type(config.tally_hash_type)
             .args(Bytes::from(vec![42; 32]).pack())
             .build();
-        let (vote_raw, spend_raw) = vote_and_spend_transactions(proposal_id);
+        let (vote_raw, _) = vote_and_spend_transactions(proposal_id);
         let vote_block =
             prove_block_transactions(10, 0, core::slice::from_ref(&vote_raw), [20; 32], &[0])
                 .unwrap();
@@ -1613,65 +1438,13 @@ mod tests {
         };
         let event_key = state_key(EVENT_STATE_NAMESPACE, omitted_hash);
         assert!(verify_smt_transition(
-            candidate_state.events_root,
-            candidate_state.events_root,
+            candidate_state.state_root,
+            candidate_state.state_root,
             &event_proof,
             &[LeafTransition {
                 key: event_key,
                 old_value: ZERO,
                 new_value: ZERO,
-            }],
-        ));
-
-        let omitted_spend =
-            prove_transaction(13, 0, core::slice::from_ref(&spend_raw), [22; 32], 0).unwrap();
-        let spend_hash = RawTransaction::from_slice(&spend_raw)
-            .unwrap()
-            .calc_tx_hash()
-            .as_slice()
-            .try_into()
-            .unwrap();
-        let dao_out_point = OutPoint {
-            tx_hash: [9; 32],
-            index: 0,
-        };
-        let spend_challenge = TallyBuilder::build_omitted_spend_challenge_from_candidate(
-            proposal_id,
-            &proposal,
-            config,
-            &source,
-            candidate_out_point,
-            omitted_spend,
-            dao_out_point,
-        )
-        .unwrap();
-        let treasury_common::TallyWitness::ChallengeSpend {
-            voter_lock_hash,
-            event_proof,
-            dao_proof,
-            ..
-        } = spend_challenge
-        else {
-            panic!("expected omitted-spend challenge");
-        };
-        assert!(verify_smt_transition(
-            candidate_state.events_root,
-            candidate_state.events_root,
-            &event_proof,
-            &[LeafTransition {
-                key: state_key(EVENT_STATE_NAMESPACE, spend_hash),
-                old_value: ZERO,
-                new_value: ZERO,
-            }],
-        ));
-        assert!(verify_smt_transition(
-            candidate_state.dao_root,
-            candidate_state.dao_root,
-            &dao_proof,
-            &[LeafTransition {
-                key: state_key(DAO_STATE_NAMESPACE, dao_out_point.key()),
-                old_value: voter_lock_hash,
-                new_value: voter_lock_hash,
             }],
         ));
     }

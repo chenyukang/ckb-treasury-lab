@@ -410,21 +410,6 @@ fn historical_vote_raw(
         .build()
 }
 
-fn historical_dao_spend_raw() -> RawTransaction {
-    let dao_out_point = OutPoint::new_builder()
-        .tx_hash(Byte32::from_slice(&[0x44; 32]).unwrap())
-        .index(1u32)
-        .build();
-    RawTransaction::new_builder()
-        .inputs(
-            [CellInput::new_builder()
-                .previous_output(dao_out_point)
-                .build()]
-            .pack(),
-        )
-        .build()
-}
-
 fn historical_unique_vote_raw(
     proposal_id: [u8; 32],
     vote_code_hash: [u8; 32],
@@ -844,9 +829,7 @@ fn policy_contract_rejects_proposal_bound_to_different_config() {
         sequence: 1,
         next_block: proposal.end_block + 1,
         next_tx_index: 0,
-        votes_root: [10; 32],
-        dao_root: [11; 32],
-        events_root: [12; 32],
+        state_root: [10; 32],
         yes: 2_000 * CKB as u128,
         no: 0,
         processed_events: 1,
@@ -1179,7 +1162,7 @@ fn build_tally_batch_tx(
     include_fillers: bool,
     max_batch_witness_bytes: u32,
     mutate: impl FnOnce(&mut TallyState, &mut BatchWitness),
-) -> (Context, TransactionView, usize, usize) {
+) -> (Context, TransactionView, usize, usize, usize, usize, usize) {
     let mut context = Context::default();
     let tally_code = context.deploy_cell_by_name("tally-type-script");
     let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
@@ -1204,8 +1187,8 @@ fn build_tally_batch_tx(
         create_proposal_config_dep(&mut context, &always_success, &session_lock, config);
     let mut proposal = proposal(proposal_id, vote_code_hash);
     proposal.proposal_config_type_hash = config_hash;
-    proposal.max_events_per_batch = 1_000;
-    proposal.max_state_keys_per_batch = 4096;
+    proposal.max_events_per_batch = vote_count.try_into().unwrap();
+    proposal.max_state_keys_per_batch = vote_count.checked_mul(2).unwrap().try_into().unwrap();
     proposal.max_batch_witness_bytes = max_batch_witness_bytes;
     let proposal_cell = context.create_cell(
         CellOutput::new_builder()
@@ -1305,6 +1288,13 @@ fn build_tally_batch_tx(
         )
         .unwrap();
     mutate(&mut output_state, &mut batch);
+    let state_proof_bytes = batch.state_proof.len();
+    let state_transition_count = batch.state_transitions.len();
+    let block_proof_bytes = batch
+        .blocks
+        .iter()
+        .map(|block| block.lemmas.len() * 32)
+        .sum();
     let vote_cell_deps = install_batch_vote_cells(&mut context, &mut batch, &raw_transactions, 2);
 
     let tally_input = context.create_cell(
@@ -1343,57 +1333,107 @@ fn build_tally_batch_tx(
         .build();
     let tx = context.complete_tx(tx);
     let transaction_bytes = tx.data().serialized_size_in_block();
-    (context, tx, batch_witness_bytes, transaction_bytes)
+    (
+        context,
+        tx,
+        batch_witness_bytes,
+        transaction_bytes,
+        state_proof_bytes,
+        state_transition_count,
+        block_proof_bytes,
+    )
 }
 
-fn benchmark_tally_batch(vote_count: usize) -> (u64, usize, usize) {
-    let (context, tx, batch_witness_bytes, transaction_bytes) =
-        build_tally_batch_tx(vote_count, false, 2_000_000, |_, _| {});
+fn benchmark_tally_batch(vote_count: usize) -> (u64, usize, usize, usize, usize, usize) {
+    let (
+        context,
+        tx,
+        batch_witness_bytes,
+        transaction_bytes,
+        state_proof_bytes,
+        state_transition_count,
+        block_proof_bytes,
+    ) = build_tally_batch_tx(vote_count, false, 2_000_000, |_, _| {});
     let cycles = context.verify_tx(&tx, 3_500_000_000).unwrap();
-    (cycles, batch_witness_bytes, transaction_bytes)
+    (
+        cycles,
+        batch_witness_bytes,
+        transaction_bytes,
+        state_proof_bytes,
+        state_transition_count,
+        block_proof_bytes,
+    )
 }
 
 #[test]
 #[ignore = "cycle benchmark"]
 fn benchmark_tally_batch_cycles() {
-    for vote_count in [1usize, 10, 20, 21, 22, 23, 50, 100, 200, 500] {
-        let (cycles, witness_bytes, transaction_bytes) = benchmark_tally_batch(vote_count);
+    for vote_count in [1usize, 10, 20, 50, 100, 200, 500, 750, 1_000] {
+        let (
+            cycles,
+            witness_bytes,
+            transaction_bytes,
+            state_proof_bytes,
+            state_transition_count,
+            block_proof_bytes,
+        ) = benchmark_tally_batch(vote_count);
         println!(
-            "votes={vote_count} cycles={cycles} cycles_per_vote={} witness_bytes={witness_bytes} transaction_bytes={transaction_bytes}",
+            "votes={vote_count} cycles={cycles} cycles_per_vote={} witness_bytes={witness_bytes} transaction_bytes={transaction_bytes} smt_proof_bytes={state_proof_bytes} state_transitions={state_transition_count} block_proof_bytes={block_proof_bytes}",
             cycles / vote_count as u64
         );
     }
 }
 
 #[test]
+#[ignore = "capacity boundary benchmark"]
+fn benchmark_tally_batch_capacity_boundary() {
+    const MAX_BLOCK_BYTES: usize = 597_000;
+    const MAX_BLOCK_CYCLES: u64 = 3_500_000_000;
+
+    for vote_count in [1_365usize, 1_366] {
+        let (context, tx, witness_bytes, transaction_bytes, state_proof_bytes, _, _) =
+            build_tally_batch_tx(vote_count, false, 2_000_000, |_, _| {});
+        match context.verify_tx(&tx, MAX_BLOCK_CYCLES) {
+            Ok(cycles) => println!(
+                "votes={vote_count} valid=true cycles={cycles} witness_bytes={witness_bytes} transaction_bytes={transaction_bytes} smt_proof_bytes={state_proof_bytes} fits_bytes={}",
+                transaction_bytes <= MAX_BLOCK_BYTES
+            ),
+            Err(error) => println!(
+                "votes={vote_count} valid=false witness_bytes={witness_bytes} transaction_bytes={transaction_bytes} smt_proof_bytes={state_proof_bytes} error={error}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn tally_contract_rejects_malformed_block_multiproofs() {
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
         batch.blocks[0].events[1].tx_index = batch.blocks[0].events[0].tx_index;
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
         batch.blocks[0].events.swap(0, 1);
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
         batch.blocks[0].lemmas.push([0x55; 32]);
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, true, 2_000_000, |_, batch| {
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(2, true, 2_000_000, |_, batch| {
         assert!(!batch.blocks[0].lemmas.is_empty());
         batch.blocks[0].lemmas.pop();
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
         batch.blocks[0].block_number += 1;
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
 
-    let (context, tx, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(2, false, 2_000_000, |_, batch| {
         batch.blocks[0].events[0]
             .vote
             .as_mut()
@@ -1406,7 +1446,7 @@ fn tally_contract_rejects_malformed_block_multiproofs() {
 
 #[test]
 fn tally_contract_checks_witness_size_before_decoding() {
-    let (context, tx, _, _) = build_tally_batch_tx(1, false, 1, |_, _| {});
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(1, false, 1, |_, _| {});
     let malformed = WitnessArgs::new_builder()
         .input_type(Some(Bytes::from(vec![0; 2])).pack())
         .build();
@@ -1421,7 +1461,7 @@ fn tally_contract_checks_witness_size_before_decoding() {
 
 #[test]
 fn tally_contract_rejects_incorrect_output_amount() {
-    let (context, tx, _, _) = build_tally_batch_tx(1, false, 2_000_000, |output, _| {
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(1, false, 2_000_000, |output, _| {
         output.no -= CKB as u128;
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
@@ -1429,7 +1469,7 @@ fn tally_contract_rejects_incorrect_output_amount() {
 
 #[test]
 fn tally_contract_rejects_tampered_proven_vote_amount() {
-    let (context, tx, _, _) = build_tally_batch_tx(1, false, 2_000_000, |_, batch| {
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(1, false, 2_000_000, |_, batch| {
         batch.blocks[0].events[0].vote.as_mut().unwrap().data.amount -= CKB;
     });
     assert!(context.verify_tx(&tx, 100_000_000).is_err());
@@ -1437,7 +1477,7 @@ fn tally_contract_rejects_tampered_proven_vote_amount() {
 
 #[test]
 fn tally_contract_accepts_partial_block_multiproof() {
-    let (context, tx, _, _) = build_tally_batch_tx(2, true, 2_000_000, |_, batch| {
+    let (context, tx, _, _, _, _, _) = build_tally_batch_tx(2, true, 2_000_000, |_, batch| {
         assert!(!batch.blocks[0].lemmas.is_empty());
         assert_eq!(batch.blocks[0].events.len(), 2);
         assert_eq!(batch.blocks[0].tx_count, 4);
@@ -1712,142 +1752,6 @@ fn omitted_vote_challenge_slashes_candidate_bond() {
 }
 
 #[test]
-fn omitted_live_dao_spend_challenge_slashes_candidate_bond() {
-    let mut context = Context::default();
-    let tally_code = context.deploy_cell_by_name("tally-type-script");
-    let always_success = context.deploy_cell(ALWAYS_SUCCESS.clone());
-    let session_lock = context
-        .build_script(&always_success, Bytes::from(vec![1]))
-        .unwrap();
-    let challenger_lock = context
-        .build_script(&always_success, Bytes::from(vec![9]))
-        .unwrap();
-    let proposal_type = context
-        .build_script(&always_success, Bytes::from(vec![2]))
-        .unwrap();
-    let proposal_id = proposal_type
-        .calc_script_hash()
-        .as_slice()
-        .try_into()
-        .unwrap();
-    let vote_code_hash = [0x22; 32];
-    let tally_script = context
-        .build_script(&tally_code, Bytes::from(vec![0x79; 32]))
-        .unwrap();
-    let config =
-        tally_proposal_config(&proposal_type, vote_code_hash, &tally_script, &session_lock);
-    let (config_cell, config_hash) =
-        create_proposal_config_dep(&mut context, &always_success, &session_lock, config);
-    let mut proposal = proposal(proposal_id, vote_code_hash);
-    proposal.proposal_config_type_hash = config_hash;
-    let proposal_cell = context.create_cell(
-        CellOutput::new_builder()
-            .capacity(1_000 * CKB)
-            .lock(session_lock.clone())
-            .type_(Some(proposal_type).pack())
-            .build(),
-        Bytes::from(proposal.encode()),
-    );
-
-    let vote_raw = historical_vote_raw(proposal_id, vote_code_hash, session_lock.clone(), 0);
-    let vote =
-        prove_block_transactions(10, 0, &[vote_raw.as_slice().to_vec()], [0x66; 32], &[0]).unwrap();
-    let mut builder = TallyBuilder::new(
-        proposal_id,
-        session_lock
-            .calc_script_hash()
-            .as_slice()
-            .try_into()
-            .unwrap(),
-        proposal.start_block,
-        config,
-    );
-    let (candidate, _) = builder
-        .build_batch(
-            &proposal,
-            vec![vote],
-            proposal.end_block + 1,
-            0,
-            proposal.end_block,
-        )
-        .unwrap();
-
-    let spend_raw = historical_dao_spend_raw();
-    let witnesses_root = [0x88; 32];
-    let omitted_spend =
-        prove_transaction(11, 0, &[spend_raw.as_slice().to_vec()], witnesses_root, 0).unwrap();
-    let spend_hash: [u8; 32] = spend_raw.calc_tx_hash().as_slice().try_into().unwrap();
-    let spend_header = HeaderBuilder::default()
-        .number(11u64)
-        .epoch(EpochNumberWithFraction::new(0, 11, 100))
-        .transactions_root(Byte32::from_slice(&hash_pair(&spend_hash, &witnesses_root)).unwrap())
-        .build();
-    context.insert_header(spend_header.clone());
-    let challenge = builder
-        .build_omitted_spend_challenge(
-            omitted_spend,
-            treasury_common::OutPoint {
-                tx_hash: [0x44; 32],
-                index: 1,
-            },
-        )
-        .unwrap();
-
-    let bond = 2_000 * CKB;
-    let candidate_cell = context.create_cell(
-        CellOutput::new_builder()
-            .capacity(bond)
-            .lock(session_lock)
-            .type_(Some(tally_script).pack())
-            .build(),
-        Bytes::from(candidate.encode()),
-    );
-    let sender_capacity = 100 * CKB;
-    let challenger_cell = context.create_cell(
-        CellOutput::new_builder()
-            .capacity(sender_capacity)
-            .lock(challenger_lock.clone())
-            .build(),
-        Bytes::new(),
-    );
-    let witness = WitnessArgs::new_builder()
-        .input_type(Some(Bytes::from(challenge.encode().unwrap())).pack())
-        .build();
-    let tx = TransactionBuilder::default()
-        .cell_dep(CellDep::new_builder().out_point(proposal_cell).build())
-        .cell_dep(CellDep::new_builder().out_point(config_cell).build())
-        .header_dep(spend_header.hash())
-        .input(
-            CellInput::new_builder()
-                .previous_output(candidate_cell)
-                .build(),
-        )
-        .input(
-            CellInput::new_builder()
-                .previous_output(challenger_cell)
-                .build(),
-        )
-        .output(
-            CellOutput::new_builder()
-                .capacity(bond)
-                .lock(challenger_lock.clone())
-                .build(),
-        )
-        .output_data(Bytes::new().pack())
-        .output(
-            CellOutput::new_builder()
-                .capacity(sender_capacity)
-                .lock(challenger_lock)
-                .build(),
-        )
-        .output_data(Bytes::new().pack())
-        .witness(witness.as_bytes().pack())
-        .build();
-    let tx = context.complete_tx(tx);
-    context.verify_tx(&tx, 100_000_000).unwrap();
-}
-
-#[test]
 fn tally_finalize_requires_candidate_relative_since() {
     let mut context = Context::default();
     let tally_code = context.deploy_cell_by_name("tally-type-script");
@@ -1893,9 +1797,7 @@ fn tally_finalize_requires_candidate_relative_since() {
         sequence: 1,
         next_block: proposal.end_block + 1,
         next_tx_index: 0,
-        votes_root: [0; 32],
-        dao_root: [0; 32],
-        events_root: [0; 32],
+        state_root: [0; 32],
         yes: 0,
         no: 0,
         processed_events: 0,
@@ -1971,9 +1873,7 @@ fn tally_state_encoding_used_by_test_is_canonical() {
         sequence: 0,
         next_block: 10,
         next_tx_index: 0,
-        votes_root: [0; 32],
-        dao_root: [0; 32],
-        events_root: [0; 32],
+        state_root: [0; 32],
         yes: 0,
         no: 0,
         processed_events: 0,

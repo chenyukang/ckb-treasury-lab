@@ -8,12 +8,11 @@ use merkle_cbt::{MerkleProof, merkle_tree::Merge};
 use sparse_merkle_tree::{CompiledMerkleProof, H256, blake2b::Blake2bHasher};
 
 pub const VERSION: u8 = 1;
-pub const TALLY_WITNESS_VERSION: u8 = 5;
+pub const TALLY_WITNESS_VERSION: u8 = 6;
 pub const VOTE_STATE_NAMESPACE: u8 = 0;
-pub const DAO_STATE_NAMESPACE: u8 = 1;
-pub const EVENT_STATE_NAMESPACE: u8 = 2;
+pub const EVENT_STATE_NAMESPACE: u8 = 1;
 pub const PROPOSAL_DATA_LEN: usize = 150;
-pub const TALLY_STATE_LEN: usize = 226;
+pub const TALLY_STATE_LEN: usize = 162;
 pub const RESULT_DATA_LEN: usize = 170;
 pub const PROPOSAL_CONFIG_LEN: usize = 271;
 pub const TREASURY_CONFIG_LEN: usize = 97;
@@ -23,7 +22,6 @@ pub const EVENT_PRESENT: Hash = [
 
 pub const TALLY_ACTION_ADVANCE: u8 = 0;
 pub const TALLY_ACTION_CHALLENGE_VOTE: u8 = 1;
-pub const TALLY_ACTION_CHALLENGE_SPEND: u8 = 2;
 pub const TALLY_ACTION_FINALIZE: u8 = 3;
 
 pub type Hash = [u8; 32];
@@ -181,7 +179,6 @@ pub struct VoteRecord {
     pub amount: u64,
     pub block_number: u64,
     pub tx_index: u32,
-    pub dao_out_points: Vec<OutPoint>,
 }
 
 impl VoteRecord {
@@ -196,14 +193,6 @@ impl VoteRecord {
         let amount = reader.u64()?;
         let block_number = reader.u64()?;
         let tx_index = reader.u32()?;
-        let count = reader.u16()? as usize;
-        if count == 0 {
-            return Err(CodecError::InvalidValue);
-        }
-        let mut dao_out_points = Vec::with_capacity(count);
-        for _ in 0..count {
-            dao_out_points.push(OutPoint::decode(&mut reader)?);
-        }
         reader.finish()?;
         Ok(Self {
             voter_lock_hash,
@@ -211,30 +200,20 @@ impl VoteRecord {
             amount,
             block_number,
             tx_index,
-            dao_out_points,
         })
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        if self.direction > 1 || self.dao_out_points.is_empty() {
+        if self.direction > 1 {
             return Err(CodecError::InvalidValue);
         }
-        let count: u16 = self
-            .dao_out_points
-            .len()
-            .try_into()
-            .map_err(|_| CodecError::Overflow)?;
-        let mut output = Vec::with_capacity(56 + self.dao_out_points.len() * OutPoint::ENCODED_LEN);
+        let mut output = Vec::with_capacity(54);
         output.push(VERSION);
         output.extend_from_slice(&self.voter_lock_hash);
         output.push(self.direction);
         output.extend_from_slice(&self.amount.to_le_bytes());
         output.extend_from_slice(&self.block_number.to_le_bytes());
         output.extend_from_slice(&self.tx_index.to_le_bytes());
-        output.extend_from_slice(&count.to_le_bytes());
-        for out_point in &self.dao_out_points {
-            out_point.encode_into(&mut output);
-        }
         Ok(output)
     }
 
@@ -339,9 +318,7 @@ pub struct TallyState {
     pub sequence: u32,
     pub next_block: u64,
     pub next_tx_index: u32,
-    pub votes_root: Hash,
-    pub dao_root: Hash,
-    pub events_root: Hash,
+    pub state_root: Hash,
     pub yes: u128,
     pub no: u128,
     pub processed_events: u64,
@@ -362,9 +339,7 @@ impl TallyState {
             sequence: reader.u32()?,
             next_block: reader.u64()?,
             next_tx_index: reader.u32()?,
-            votes_root: reader.hash()?,
-            dao_root: reader.hash()?,
-            events_root: reader.hash()?,
+            state_root: reader.hash()?,
             yes: reader.u128()?,
             no: reader.u128()?,
             processed_events: reader.u64()?,
@@ -383,9 +358,7 @@ impl TallyState {
         output.extend_from_slice(&self.sequence.to_le_bytes());
         output.extend_from_slice(&self.next_block.to_le_bytes());
         output.extend_from_slice(&self.next_tx_index.to_le_bytes());
-        output.extend_from_slice(&self.votes_root);
-        output.extend_from_slice(&self.dao_root);
-        output.extend_from_slice(&self.events_root);
+        output.extend_from_slice(&self.state_root);
         output.extend_from_slice(&self.yes.to_le_bytes());
         output.extend_from_slice(&self.no.to_le_bytes());
         output.extend_from_slice(&self.processed_events.to_le_bytes());
@@ -743,17 +716,16 @@ impl ProvenBlockEvent {
     fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         Ok(Self {
             tx_index: reader.u32()?,
-            raw_transaction: reader.length_prefixed_bytes()?,
+            raw_transaction: Vec::new(),
             vote: decode_optional_vote(reader)?,
         })
     }
 
     fn encode_into(&self, output: &mut Vec<u8>) -> Result<(), CodecError> {
-        if self.raw_transaction.is_empty() && self.vote.is_none() {
+        if !self.raw_transaction.is_empty() || self.vote.is_none() {
             return Err(CodecError::InvalidValue);
         }
         output.extend_from_slice(&self.tx_index.to_le_bytes());
-        encode_length_prefixed(&self.raw_transaction, output)?;
         encode_optional_vote(&self.vote, output)
     }
 }
@@ -899,13 +871,6 @@ pub enum TallyWitness {
         omitted: ProvenTransaction,
         event_proof: Vec<u8>,
     },
-    ChallengeSpend {
-        omitted_spend: ProvenTransaction,
-        dao_out_point: OutPoint,
-        voter_lock_hash: Hash,
-        event_proof: Vec<u8>,
-        dao_proof: Vec<u8>,
-    },
     Finalize,
 }
 
@@ -918,13 +883,6 @@ impl TallyWitness {
             TALLY_ACTION_CHALLENGE_VOTE => Self::ChallengeVote {
                 omitted: ProvenTransaction::decode(&mut reader)?,
                 event_proof: reader.length_prefixed_bytes()?,
-            },
-            TALLY_ACTION_CHALLENGE_SPEND => Self::ChallengeSpend {
-                omitted_spend: ProvenTransaction::decode(&mut reader)?,
-                dao_out_point: OutPoint::decode(&mut reader)?,
-                voter_lock_hash: reader.hash()?,
-                event_proof: reader.length_prefixed_bytes()?,
-                dao_proof: reader.length_prefixed_bytes()?,
             },
             TALLY_ACTION_FINALIZE => Self::Finalize,
             _ => return Err(CodecError::InvalidValue),
@@ -948,20 +906,6 @@ impl TallyWitness {
                 output.push(TALLY_ACTION_CHALLENGE_VOTE);
                 omitted.encode_into(&mut output)?;
                 encode_length_prefixed(event_proof, &mut output)?;
-            }
-            Self::ChallengeSpend {
-                omitted_spend,
-                dao_out_point,
-                voter_lock_hash,
-                event_proof,
-                dao_proof,
-            } => {
-                output.push(TALLY_ACTION_CHALLENGE_SPEND);
-                omitted_spend.encode_into(&mut output)?;
-                dao_out_point.encode_into(&mut output);
-                output.extend_from_slice(voter_lock_hash);
-                encode_length_prefixed(event_proof, &mut output)?;
-                encode_length_prefixed(dao_proof, &mut output)?;
             }
             Self::Finalize => output.push(TALLY_ACTION_FINALIZE),
         }
@@ -1224,6 +1168,7 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use sparse_merkle_tree::{SparseMerkleTree, default_store::DefaultStore, traits::Value};
+    extern crate std;
 
     #[derive(Default, Clone)]
     struct Word(Hash);
@@ -1239,23 +1184,19 @@ mod tests {
     }
 
     #[test]
-    fn vote_record_round_trip_and_hash_commits_to_dao_out_points() {
+    fn vote_record_round_trip_and_hash_commits_to_vote_position() {
         let record = VoteRecord {
             voter_lock_hash: [1; 32],
             direction: 1,
             amount: 42,
             block_number: 100,
             tx_index: 3,
-            dao_out_points: alloc::vec![OutPoint {
-                tx_hash: [2; 32],
-                index: 7,
-            }],
         };
         let encoded = record.encode().unwrap();
         assert_eq!(VoteRecord::decode(&encoded).unwrap(), record);
 
         let mut changed = record.clone();
-        changed.dao_out_points[0].index = 8;
+        changed.tx_index = 4;
         assert_ne!(record.value_hash().unwrap(), changed.value_hash().unwrap());
     }
 
@@ -1287,9 +1228,7 @@ mod tests {
             sequence: 1,
             next_block: 11,
             next_tx_index: 0,
-            votes_root: [3; 32],
-            dao_root: [4; 32],
-            events_root: [5; 32],
+            state_root: [3; 32],
             yes: 6,
             no: 7,
             processed_events: 8,
@@ -1557,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn tally_witness_uses_explicit_v5_encoding() {
+    fn tally_witness_uses_explicit_v6_encoding() {
         let encoded = TallyWitness::Finalize.encode().unwrap();
         assert_eq!(encoded[0], TALLY_WITNESS_VERSION);
         assert_eq!(TallyWitness::decode(&encoded), Ok(TallyWitness::Finalize));
@@ -1568,22 +1507,53 @@ mod tests {
             TallyWitness::decode(&legacy),
             Err(CodecError::InvalidVersion)
         );
+        assert_eq!(
+            TallyWitness::decode(&[TALLY_WITNESS_VERSION, 2]),
+            Err(CodecError::InvalidValue)
+        );
     }
 
     #[test]
     fn state_key_namespaces_are_disjoint() {
         let key = [0xff; 32];
         let vote = namespaced_state_key(VOTE_STATE_NAMESPACE, key).unwrap();
-        let dao = namespaced_state_key(DAO_STATE_NAMESPACE, key).unwrap();
         let event = namespaced_state_key(EVENT_STATE_NAMESPACE, key).unwrap();
-        assert_ne!(vote, dao);
         assert_ne!(vote, event);
-        assert_ne!(dao, event);
         assert_eq!(
             vote,
             namespaced_state_key(VOTE_STATE_NAMESPACE, key).unwrap()
         );
-        assert!(namespaced_state_key(3, key).is_none());
+        assert!(namespaced_state_key(2, key).is_none());
+    }
+
+    #[test]
+    #[ignore = "SMT proof size benchmark"]
+    fn benchmark_compiled_smt_proof_sizes() {
+        type Smt = SparseMerkleTree<Blake2bHasher, Word, DefaultStore<Word>>;
+
+        for existing_leaves in [0u32, 300, 3_000, 30_000] {
+            let mut tree = Smt::default();
+            for index in 0..existing_leaves {
+                tree.update(benchmark_key(index).into(), Word([1; 32]))
+                    .unwrap();
+            }
+            let keys = (existing_leaves..existing_leaves + 200)
+                .map(|index| benchmark_key(index).into())
+                .collect::<Vec<H256>>();
+            let proof = tree
+                .merkle_proof(keys.clone())
+                .unwrap()
+                .compile(keys)
+                .unwrap();
+            std::println!(
+                "existing_leaves={existing_leaves} target_leaves=200 smt_proof_bytes={}",
+                proof.0.len()
+            );
+        }
+    }
+
+    fn benchmark_key(index: u32) -> Hash {
+        blake2b_256(&index.to_le_bytes())
     }
 
     #[test]

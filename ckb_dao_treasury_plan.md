@@ -2,6 +2,55 @@
 
 Last updated: 2026-08-27
 
+Sizes in this document use decimal KB (`1 KB = 1,000 bytes`).
+
+## Vote-Time DAO Eligibility (2026-08-27)
+
+### Objective
+
+Count a vote when its immutable VoteEventCell is created from live, eligible DAO
+CellDeps. Spending those DAO Cells after voting does not revoke the vote. Remove
+DAO-spend events, the DAO-outpoint SMT namespace, and omitted-spend challenges
+from tally settlement.
+
+### Steps
+
+- [x] Inspect the V5 wire format, reducer, scanner, contract tests, live E2E, and
+  benchmark harness.
+- [x] Upgrade the tally witness and reducer to the vote-time eligibility model.
+- [x] Replace spend-liveness tests and update protocol documentation.
+- [x] Rebuild and deploy the contracts; run unit, contract, and live-chain E2E
+  tests.
+- [x] Measure the default-limit vote capacity and SMT proof sizes.
+
+### Implementation Notes
+
+- V6 has one `TallyState.state_root` and two SMT namespaces: vote and event.
+- VoteRecord no longer stores DAO outpoints. VoteData still commits them so the
+  Vote Type Script can validate live DAO deposits at vote creation.
+- DAO-spend transactions are not scanned, encoded, or challengeable. The only
+  completeness challenge is an omitted immutable VoteEventCell.
+
+### Validation
+
+- All release CKB-VM contracts rebuilt cleanly. The stripped Tally Type Script
+  is 217.576 KB; the Vote Type Script is 72.544 KB.
+- Formatting, full Clippy with warnings denied, and 37 non-ignored common,
+  builder, and CKB-VM contract tests passed.
+- Fresh-chain V6 E2E passed proposal creation, DAO age rejection, two votes, a
+  real DAO phase-1 spend after voting, omitted-vote challenge, complete tally,
+  challenge maturity, Result creation, and Treasury payout. The spent deposit's
+  vote remained counted. Report:
+  `impl/target/live-e2e/1787822684-11839/report.json`.
+- The ideal empty-state 100-vote batch used 208,647,822 cycles, a 32.869 KB
+  witness, a 37.262 KB transaction, and a 0.895 KB SMT proof.
+- Under default 3.5B-cycle and 597 KB block limits, 1,365 ideal independent
+  votes passed at 2,839,164,998 cycles and 498.948 KB. At 1,366 votes the
+  contract hit its deterministic CKB-VM heap-allocation boundary first.
+- For 200 absent target leaves (100 votes), synthetic compiled SMT proofs were
+  0.889, 13.925, 34.875, and 56.983 KB against 0, 300, 3,000, and 30,000
+  existing nonzero leaves respectively.
+
 ## DAO Deposit Age Validation (2026-08-27)
 
 ### Objective
@@ -30,7 +79,7 @@ numbers. No raw creation transaction or transaction-position proof is needed.
 
 - The clean release build, formatting check, full Clippy run, 39 standard
   Rust/CKB-VM tests, and the ignored cycle benchmark passed.
-- The rebuilt Vote Type Script is 72,544 bytes and has CKB data hash
+- The rebuilt Vote Type Script is 72.544 KB and has CKB data hash
   `0x15ab76603782b78b5600b9874754c000a081dc9c9e6d9178ffaf1a946b545020`.
 - A fresh local CKB chain deployed the rebuilt binaries as genesis system cells.
   DAO deposits from blocks 20 and 24 could vote on the Proposal from block 28;
@@ -39,7 +88,9 @@ numbers. No raw creation transaction or transaction-position proof is needed.
   Treasury payout flow passed. Report:
   `impl/target/live-e2e/1787804454-33060/report.json`.
 
-## Objective
+## Historical V5 Implementation (Superseded)
+
+### Objective
 
 Replace raw historical vote transactions in tally witnesses with live,
 canonical VoteEventCells authenticated by transaction-position proofs. Keep
@@ -90,19 +141,19 @@ to each DAO deposit's lock script.
   creation, DAO-spend removal logic, candidate replay, and live E2E layout.
 - 2026-08-21: Corrected the design boundary: DAO-spend raw transactions and
   ChallengeSpend are retained; snapshot voting is explicitly out of scope.
-- 2026-08-21: Captured the V4 comparison baseline. For 100 votes: 59,119
-  witness bytes, 59,876 transaction bytes, and 314,614,791 cycles. For 500
-  votes: 295,249 witness bytes, 296,006 transaction bytes, and 1,566,465,014
-  cycles. Baseline stripped ELF sizes: tally-type-script 226,040 bytes and
-  vote-type-script 67,896 bytes.
+- 2026-08-21: Captured the V4 comparison baseline. For 100 votes: a 59.119 KB
+  witness, a 59.876 KB transaction, and 314,614,791 cycles. For 500 votes: a
+  295.249 KB witness, a 296.006 KB transaction, and 1,566,465,014 cycles.
+  Baseline stripped ELF sizes: tally-type-script 226.040 KB and vote-type-script
+  67.896 KB.
 - 2026-08-21: Implemented V5 compact VoteEvent proofs with direct CellDep
   indices and retained raw DAO-spend events. The builder test asserts compact
   votes carry no raw transaction while tracked spends do.
-- 2026-08-21: Final V5 measurement at 100 votes: 43,325 witness bytes, 47,782
-  transaction bytes, and 311,820,088 cycles. Compared with V4, this is 26.7%
+- 2026-08-21: Final V5 measurement at 100 votes: a 43.325 KB witness, a 47.782
+  KB transaction, and 311,820,088 cycles. Compared with V4, this is 26.7%
   smaller witness, 20.2% smaller transaction, and 0.9% fewer cycles. The final
-  stripped tally ELF is 229,904 bytes (+3,864, 1.7%); the Vote ELF is 71,304
-  bytes (+3,408, 5.0%).
+  stripped tally ELF is 229.904 KB (+3.864 KB, 1.7%); the Vote ELF is 71.304 KB
+  (+3.408 KB, 5.0%).
 - 2026-08-21: The real local CKB E2E passed proposal creation, two votes, an
   intentionally omitted vote, successful challenge, complete re-tally,
   challenge-period maturity, final settlement, and Treasury payout. Report:

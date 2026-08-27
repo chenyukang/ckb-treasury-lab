@@ -375,7 +375,7 @@ fn run() -> AnyResult<()> {
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
     let mut rpc = Rpc::new(&endpoint)?;
     rpc.wait_ready()?;
-    println!("V5 live-chain E2E");
+    println!("V6 live-chain E2E");
     println!("  chain directory             {}", run_dir.display());
     println!("  RPC                         {endpoint}");
 
@@ -612,6 +612,20 @@ fn run() -> AnyResult<()> {
     )?;
     if vote1.block_number > end_block || vote2.block_number > end_block {
         return Err(other("a vote was committed after the voting window"));
+    }
+    let dao1_spend = rpc.commit(
+        "spend DAO deposit after vote",
+        transaction(
+            vec![input(&dao1_cell.out_point)],
+            vec![code_dep(&code_cells.always), code_dep(&code_cells.dao)],
+            vec![dao1_header],
+            vec![output(1_000 * CKB, &voter1_lock, Some(dao_type.clone()))],
+            vec![Bytes::from(dao1.block_number.to_le_bytes().to_vec())],
+            vec![],
+        ),
+    )?;
+    if dao1_spend.block_number > end_block {
+        return Err(other("the DAO spend was committed after the voting window"));
     }
     rpc.mine_to(end_block)?;
 
@@ -946,6 +960,7 @@ fn run() -> AnyResult<()> {
         "transactions": {
             "dao_deposit_1": commit_json(&dao1),
             "dao_deposit_2": commit_json(&dao2),
+            "dao_spend_after_vote": commit_json(&dao1_spend),
             "late_dao_deposit": commit_json(&late_dao),
             "proposal": commit_json(&proposal_commit),
             "vote_1": commit_json(&vote1),
@@ -960,6 +975,7 @@ fn run() -> AnyResult<()> {
         "assertions": [
             "Treasury Cell was created by a mined Cellbase transaction",
             "a DAO deposit created after the Proposal Cell was rejected for voting",
+            "spending a DAO deposit after voting did not revoke its vote",
             "omitted-vote candidate was accepted and then consumed by a valid challenge",
             "complete tally counted both DAO deposits",
             "policy produced a passed Result Cell",
@@ -970,7 +986,7 @@ fn run() -> AnyResult<()> {
     let report_path = run_dir.join("report.json");
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("  report                      {}", report_path.display());
-    println!("V5 live-chain E2E PASSED");
+    println!("V6 live-chain E2E PASSED");
     Ok(())
 }
 
@@ -1019,7 +1035,7 @@ fn write_chain_spec(
          uncles_hash = \"0x0000000000000000000000000000000000000000000000000000000000000000\"\n\
          nonce = \"0x0\"\n\n\
          [genesis.genesis_cell]\n\
-         message = \"CKB Treasury V5 live E2E\"\n\n\
+         message = \"CKB Treasury V6 live E2E\"\n\n\
          [genesis.genesis_cell.lock]\n\
          code_hash = \"0xb35557e7e9854206f7bc13e3c3a7fa4cf8892c84a09237fb0aab40aab3771eee\"\n\
          args = \"0x\"\n\

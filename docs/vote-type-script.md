@@ -35,4 +35,5 @@ signature. This keeps their lock, type, and canonical vote data available as
 CellDeps to every parallel tally and omitted-vote challenge. V2 deliberately has
 no timeout reclaim path: a safe reclaim design needs durable on-chain evidence
 that all tally and challenge work is over. The referenced DAO deposits remain
-spendable; a spend is included as a raw DAO-spend event and revokes the vote.
+spendable. Spending one after VoteEventCell creation does not revoke the vote and
+is not included in tally settlement.

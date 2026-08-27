@@ -5,10 +5,7 @@ ckb_std::entry!(program_entry);
 ckb_std::default_alloc!(16384, 2560000, 64);
 
 use alloc::collections::BTreeMap;
-use ckb_gen_types::{
-    packed::{CellDepVec, RawTransaction},
-    prelude::*,
-};
+use ckb_gen_types::{packed::CellDepVec, prelude::*};
 use ckb_std::{
     ckb_constants::Source,
     high_level::{
@@ -20,9 +17,9 @@ use ckb_std::{
     type_id::check_type_id,
 };
 use treasury_common::{
-    BatchWitness, DAO_STATE_NAMESPACE, EVENT_PRESENT, EVENT_STATE_NAMESPACE, Hash, LeafTransition,
-    OutPoint, ProposalConfig, ProposalData, ProposalPhase, ProvenBlock, ProvenTransaction,
-    ProvenVote, TallyPhase, TallyState, TallyWitness, VOTE_STATE_NAMESPACE, VoteData, VoteRecord,
+    BatchWitness, EVENT_PRESENT, EVENT_STATE_NAMESPACE, Hash, LeafTransition, OutPoint,
+    ProposalConfig, ProposalData, ProposalPhase, ProvenBlock, ProvenTransaction, ProvenVote,
+    TallyPhase, TallyState, TallyWitness, VOTE_STATE_NAMESPACE, VoteData, VoteRecord,
     cbmt_multi_root, namespaced_state_key, transactions_root, verify_smt_transition,
 };
 
@@ -45,7 +42,6 @@ enum Error {
     HeaderInvalid,
     TransactionProofInvalid,
     TransactionInvalid,
-    EventNotRelevant,
     SmtProofInvalid,
     ReducerMismatch,
     TallyOverflow,
@@ -90,9 +86,7 @@ fn create() -> Result<(), Error> {
         || state.sequence != 0
         || state.next_block != proposal.start_block
         || state.next_tx_index != 0
-        || state.votes_root != ZERO
-        || state.dao_root != ZERO
-        || state.events_root != ZERO
+        || state.state_root != ZERO
         || state.yes != 0
         || state.no != 0
         || state.processed_events != 0
@@ -153,25 +147,6 @@ fn consume() -> Result<(), Error> {
             let (proposal, config) = load_proposal_dep(state.proposal_id)?;
             ensure_tally_identity(&config)?;
             challenge_vote(&state, &proposal, &config, &omitted, &event_proof)
-        }
-        TallyWitness::ChallengeSpend {
-            omitted_spend,
-            dao_out_point,
-            voter_lock_hash,
-            event_proof,
-            dao_proof,
-        } => {
-            let (proposal, config) = load_proposal_dep(state.proposal_id)?;
-            ensure_tally_identity(&config)?;
-            ensure_in_voting_window(&omitted_spend, &proposal)?;
-            challenge_spend(
-                &state,
-                &omitted_spend,
-                dao_out_point,
-                voter_lock_hash,
-                &event_proof,
-                &dao_proof,
-            )
         }
         TallyWitness::Finalize => {
             let (proposal, config) = load_proposal_input(state.proposal_id)?;
@@ -252,17 +227,15 @@ fn verify_batch(
             return Err(Error::InvalidTransition);
         }
     }
-    let input_root = unified_root(input).ok_or(Error::InvalidState)?;
-    let output_root = unified_root(output).ok_or(Error::InvalidState)?;
+    let input_root = input.state_root;
+    let output_root = output.state_root;
 
     if event_count == 0 {
         if !batch.blocks.is_empty()
             || !batch.previous_vote_records.is_empty()
             || !batch.state_transitions.is_empty()
             || !batch.state_proof.is_empty()
-            || output.votes_root != input.votes_root
-            || output.dao_root != input.dao_root
-            || output.events_root != input.events_root
+            || output.state_root != input.state_root
             || output.yes != input.yes
             || output.no != input.no
         {
@@ -311,60 +284,18 @@ fn verify_batch(
             }
             *event_value = EVENT_PRESENT;
 
-            let spent_out_points = event
-                .raw
-                .as_ref()
-                .map(|raw| {
-                    raw.inputs()
-                        .into_iter()
-                        .map(|input| unpack_out_point(&input.previous_output()))
-                        .collect::<alloc::vec::Vec<_>>()
-                })
-                .unwrap_or_default();
-            let mut relevant = false;
-            let mut has_tracked_spend = false;
-            for out_point in &spent_out_points {
-                let key = state_key(DAO_STATE_NAMESPACE, out_point.key());
-                if let Some(voter) = state_values
-                    .get(&key)
-                    .copied()
-                    .filter(|value| *value != ZERO)
-                {
-                    remove_record(voter, &mut state_values, &mut records, &mut yes, &mut no)?;
-                    relevant = true;
-                    has_tracked_spend = true;
-                }
-            }
-
-            if let Some(vote) = event.vote {
-                if vote.data.dao_out_points.len() > proposal.max_dao_deps_per_vote as usize {
-                    return Err(Error::TransactionInvalid);
-                }
-                if vote
-                    .data
-                    .dao_out_points
-                    .iter()
-                    .any(|out_point| spent_out_points.contains(out_point))
-                {
-                    return Err(Error::TransactionInvalid);
-                }
-                let record = VoteRecord {
-                    voter_lock_hash: vote.voter_lock_hash,
-                    direction: vote.data.direction,
-                    amount: vote.data.amount,
-                    block_number: block.block_number,
-                    tx_index: event.tx_index,
-                    dao_out_points: vote.data.dao_out_points,
-                };
-                apply_record(record, &mut state_values, &mut records, &mut yes, &mut no)?;
-                relevant = true;
-            }
-            if event.raw.is_some() && !has_tracked_spend {
+            let vote = event.vote;
+            if vote.data.dao_out_points.len() > proposal.max_dao_deps_per_vote as usize {
                 return Err(Error::TransactionInvalid);
             }
-            if !relevant {
-                return Err(Error::EventNotRelevant);
-            }
+            let record = VoteRecord {
+                voter_lock_hash: vote.voter_lock_hash,
+                direction: vote.data.direction,
+                amount: vote.data.amount,
+                block_number: block.block_number,
+                tx_index: event.tx_index,
+            };
+            apply_record(record, &mut state_values, &mut records, &mut yes, &mut no)?;
         }
     }
 
@@ -380,8 +311,7 @@ fn verify_batch(
 struct VerifiedEvent {
     tx_index: u32,
     tx_hash: Hash,
-    raw: Option<RawTransaction>,
-    vote: Option<ProvenVote>,
+    vote: ProvenVote,
 }
 
 fn verify_proven_block(
@@ -409,50 +339,17 @@ fn verify_proven_block(
             return Err(Error::TransactionProofInvalid);
         }
         previous_index = Some(event.tx_index);
-        let raw = if event.raw_transaction.is_empty() {
-            None
-        } else {
-            Some(
-                RawTransaction::from_slice(&event.raw_transaction)
-                    .map_err(|_| Error::TransactionInvalid)?,
-            )
-        };
-        let raw_hash = raw
-            .as_ref()
-            .map(|raw| raw.calc_tx_hash().as_slice().try_into().unwrap());
-        if let Some(vote) = &event.vote {
-            verify_vote_event(vote, config, proposal_id, tally_cell_deps)?;
+        if !event.raw_transaction.is_empty() {
+            return Err(Error::TransactionInvalid);
         }
-        let tx_hash = match (raw_hash, event.vote.as_ref()) {
-            (Some(raw_hash), Some(vote)) if raw_hash != vote.vote_cell.tx_hash => {
-                return Err(Error::TransactionInvalid);
-            }
-            (Some(raw_hash), _) => raw_hash,
-            (None, Some(vote)) => vote.vote_cell.tx_hash,
-            (None, None) => return Err(Error::TransactionInvalid),
-        };
-        if let Some(raw) = &raw {
-            let vote_output = raw
-                .outputs()
-                .into_iter()
-                .enumerate()
-                .find_map(|(index, output)| {
-                    output
-                        .type_()
-                        .to_opt()
-                        .filter(|script| is_vote_script(script, config, proposal_id))
-                        .map(|_| index as u32)
-                });
-            if vote_output != event.vote.as_ref().map(|vote| vote.vote_cell.index) {
-                return Err(Error::TransactionInvalid);
-            }
-        }
+        let vote = event.vote.as_ref().ok_or(Error::TransactionInvalid)?;
+        verify_vote_event(vote, config, proposal_id, tally_cell_deps)?;
+        let tx_hash = vote.vote_cell.tx_hash;
         indexed_hashes.push((event.tx_index, tx_hash));
         events.push(VerifiedEvent {
             tx_index: event.tx_index,
             tx_hash,
-            raw,
-            vote: event.vote.clone(),
+            vote: vote.clone(),
         });
     }
     let raw_root = cbmt_multi_root(proven.tx_count, &indexed_hashes, &proven.lemmas)
@@ -491,7 +388,7 @@ fn challenge_vote(
     let tx_hash = vote.vote_cell.tx_hash;
     let raw_root = merkle_raw_root(tx_hash, omitted)?;
     verify_transactions_root(raw_root, omitted)?;
-    let root = unified_root(state).ok_or(Error::InvalidState)?;
+    let root = state.state_root;
     if !verify_smt_transition(
         root,
         root,
@@ -502,49 +399,6 @@ fn challenge_vote(
             new_value: ZERO,
         }],
     ) {
-        return Err(Error::ChallengeInvalid);
-    }
-    pay_bond(challenge_sender_lock_hash()?)
-}
-
-fn challenge_spend(
-    state: &TallyState,
-    omitted_spend: &ProvenTransaction,
-    dao_out_point: OutPoint,
-    voter_lock_hash: Hash,
-    event_proof: &[u8],
-    dao_proof: &[u8],
-) -> Result<(), Error> {
-    let (spend_tx, spend_hash) = verify_proven_transaction(omitted_spend)?;
-    let spends_claimed_dao = spend_tx
-        .inputs()
-        .into_iter()
-        .map(|input| unpack_out_point(&input.previous_output()))
-        .any(|out_point| out_point == dao_out_point);
-    let root = unified_root(state).ok_or(Error::InvalidState)?;
-    if voter_lock_hash == ZERO
-        || !spends_claimed_dao
-        || !verify_smt_transition(
-            root,
-            root,
-            event_proof,
-            &[LeafTransition {
-                key: state_key(EVENT_STATE_NAMESPACE, spend_hash),
-                old_value: ZERO,
-                new_value: ZERO,
-            }],
-        )
-        || !verify_smt_transition(
-            root,
-            root,
-            dao_proof,
-            &[LeafTransition {
-                key: state_key(DAO_STATE_NAMESPACE, dao_out_point.key()),
-                old_value: voter_lock_hash,
-                new_value: voter_lock_hash,
-            }],
-        )
-    {
         return Err(Error::ChallengeInvalid);
     }
     pay_bond(challenge_sender_lock_hash()?)
@@ -565,25 +419,6 @@ fn finalize(state: &TallyState, proposal: &ProposalData) -> Result<(), Error> {
     }
     require_operator(state.operator_lock_hash)?;
     pay_bond(state.operator_lock_hash)
-}
-
-fn verify_proven_transaction(proven: &ProvenTransaction) -> Result<(RawTransaction, Hash), Error> {
-    let header = load_header(proven.header_dep_index as usize, Source::HeaderDep)
-        .map_err(|_| Error::HeaderInvalid)?;
-    let header_number: u64 = header.raw().number().unpack();
-    if header_number != proven.block_number {
-        return Err(Error::HeaderInvalid);
-    }
-    if proven.vote.is_some() {
-        return Err(Error::TransactionInvalid);
-    }
-    let raw = RawTransaction::from_slice(&proven.raw_transaction)
-        .map_err(|_| Error::TransactionInvalid)?;
-    let tx_hash = raw.calc_tx_hash().as_slice().try_into().unwrap();
-    let raw_root = merkle_raw_root(tx_hash, proven)?;
-    let _ = header;
-    verify_transactions_root(raw_root, proven)?;
-    Ok((raw, tx_hash))
 }
 
 fn verify_transactions_root(raw_root: Hash, proven: &ProvenTransaction) -> Result<(), Error> {
@@ -665,15 +500,6 @@ fn remove_record(
     }
     *vote_value = ZERO;
     subtract_tally(record.direction, record.amount, yes, no)?;
-    for out_point in &record.dao_out_points {
-        let dao_value = state_values
-            .get_mut(&state_key(DAO_STATE_NAMESPACE, out_point.key()))
-            .ok_or(Error::ReducerMismatch)?;
-        if *dao_value != voter {
-            return Err(Error::ReducerMismatch);
-        }
-        *dao_value = ZERO;
-    }
     Ok(())
 }
 
@@ -693,15 +519,6 @@ fn apply_record(
         != ZERO
     {
         remove_record(voter, state_values, records, yes, no)?;
-    }
-    for out_point in &record.dao_out_points {
-        let value = state_values
-            .get_mut(&state_key(DAO_STATE_NAMESPACE, out_point.key()))
-            .ok_or(Error::ReducerMismatch)?;
-        if *value != ZERO {
-            return Err(Error::ReducerMismatch);
-        }
-        *value = voter;
     }
     add_tally(record.direction, record.amount, yes, no)?;
     let value_hash = record.value_hash().map_err(|_| Error::ReducerMismatch)?;
@@ -734,14 +551,6 @@ fn matches_new_values(values: &BTreeMap<Hash, Hash>, transitions: &[LeafTransiti
     transitions
         .iter()
         .all(|transition| values.get(&transition.key) == Some(&transition.new_value))
-}
-
-fn unified_root(state: &TallyState) -> Option<Hash> {
-    if state.votes_root == state.dao_root && state.dao_root == state.events_root {
-        Some(state.votes_root)
-    } else {
-        None
-    }
 }
 
 fn state_key(namespace: u8, key: Hash) -> Hash {

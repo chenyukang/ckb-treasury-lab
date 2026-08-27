@@ -20,12 +20,12 @@ Proposal data contains proposal-specific limits, amount, receiver, voting and
 challenge windows, the Proposal Config reference, and a metadata commitment.
 Only the lifecycle phase may change when an Open Proposal becomes Closed.
 
-TallySession Cells are independent Type-ID cells. Each batch verifies historical
+TallyChainCells are independent Type-ID cells. Each batch verifies historical
 transaction CBMT proofs, one unified SMT transition, and the ordered reducer
-inside CKB-VM. Every TallySession transaction includes the referenced Proposal
+inside CKB-VM. Every TallyChain transaction includes the referenced Proposal
 Config Cell and verifies both the Proposal and Tally code identities against it.
-The final candidate has one challenge period. A valid omitted-vote or
-omitted-DAO-spend proof consumes the candidate and transfers its bond to the
+The final candidate has one challenge period. A valid omitted-vote proof
+consumes the candidate and transfers its bond to the
 lock of the first non-Candidate input in the challenge transaction. A mature
 candidate can create one Result Cell under the Policy Type Script authorized by
 Proposal Config.

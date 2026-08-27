@@ -2,7 +2,7 @@
 
 ## Status
 
-This document describes the V5 tally-witness implementation in `impl/`. VoteEventCells,
+This document describes the V6 tally-witness implementation in `impl/`. VoteEventCells,
 batch verification, challenges, passing-policy evaluation, treasury payout, burn,
 and grant timelocks execute in CKB-VM. The CKB node does not maintain a tally
 index and does not scan historical voting windows during transaction validation.
@@ -13,7 +13,7 @@ index and does not scan historical voting windows during transaction validation.
 flowchart LR
     P["Open Proposal Cell"] --> V["Immutable VoteEventCells on chain"]
     V --> C["Closed Proposal Cell"]
-    C --> S["Operator creates TallySession + bond"]
+    C --> S["Operator creates TallyChainCell + bond"]
     S --> B1["Batch 1: block CBMT multiproofs + SMT transition"]
     B1 --> BN["Batch N: consume prior session"]
     BN --> F["FinalCandidate"]
@@ -40,10 +40,10 @@ be consumed exactly once by the payout transaction.
   hash type are checked again by the Vote and Policy scripts. This keeps network
   identity configurable without allowing a Proposal to self-authorize a fake
   DAO-like script. A DAO outpoint cannot simultaneously be a VoteTx `cell_dep`
-  and an input; both the Vote Script and tally reducer reject this. The cell is
-  immutable so a voter cannot destroy evidence before tally or challenge. V5
+  and an input; the Vote Script rejects this. The cell is immutable so a voter
+  cannot destroy evidence before tally or challenge. V6
   intentionally leaves reclaim as unresolved lifecycle work.
-- **TallySession Cell**: a Type-ID singleton owned logically by one operator. Its
+- **TallyChainCell**: a Type-ID singleton owned logically by one operator. Its
   capacity is the settlement bond, which must be at least Proposal Config's
   absolute minimum and does not scale with the Proposal's requested payout.
   Active sessions use the operator lock. Each
@@ -82,36 +82,27 @@ VoteRecord {
     amount:          Uint64,
     block_number:    Uint64,
     tx_index:        Uint32,
-    dao_out_points:  Vec<OutPoint>,
 }
 ```
 
-The unified state SMT uses separate vote, DAO, and event key namespaces. Each
+The state SMT uses separate vote and event key namespaces. Each
 physical key is `blake2b("CKB Treasury state key V1" || namespace || logical_key)`,
 so the namespaces retain the full hash output instead of reserving or truncating
 key bits. The vote namespace stores `voter_lock_hash -> blake2b(VoteRecord)`,
-while the DAO namespace stores `dao_out_point_key -> voter_lock_hash`. When a
-voter votes again, the batch witness reveals the old VoteRecord, proves that its
-hash is the current vote-leaf value, removes all old DAO mappings and old weight,
-then installs the new record. When a referenced DAO deposit is spent, the DAO
-leaf identifies the voter and the same VoteRecord provides the complete list of
-mappings and weight to remove.
-
-This preimage is required because an SMT value hash alone cannot tell the
-contract which DAO outpoints must be deleted during revote or invalidation.
+while the event namespace stores `vote_tx_hash -> EVENT_PRESENT`. When a voter
+votes again, the batch witness reveals the old VoteRecord, proves that its hash
+is the current vote-leaf value, removes its old weight, then installs the new
+record. DAO outpoints remain in immutable VoteData so the Vote Type Script can
+validate eligibility at vote creation; they are not tally state.
 
 ## Tally state
 
-Each TallySession commits to one domain-separated SMT with three logical namespaces:
+Each TallyChainCell commits to one domain-separated SMT with two logical namespaces:
 
 - vote: voter lock hash to VoteRecord hash;
-- DAO: DAO outpoint key to voter lock hash;
-- event: historical transaction hash to `EVENT_PRESENT`.
+- event: vote transaction hash to `EVENT_PRESENT`.
 
-The current fixed-length `TallyState` layout retains the `votes_root`, `dao_root`,
-and `events_root` fields, but V5 requires all three fields to contain the same
-unified state root. A transition or candidate with unequal roots is invalid. This
-keeps the state layout stable while reducing each non-empty batch to one compiled
+`TallyState` stores one `state_root`. Each non-empty batch carries one compiled
 SMT proof verified against both the old and new roots.
 
 It also stores the next scan cursor, sequence number, `yes`, `no`, processed event
@@ -153,26 +144,28 @@ Deposits created in the Proposal's block or any later block are ineligible. A
 missing creation HeaderDep also makes the vote invalid. This authenticates Cell
 age without carrying either creation transaction in the witness; the node binds
 each resolved CellDep to its actual creation block through `transaction_info`.
+Every referenced DAO Cell must also be live when the Vote transaction executes.
+Once the immutable VoteEventCell is created, later spending a referenced DAO
+Cell does not revoke the vote and is not a tally event.
+The deposit-age rule prevents spend-and-redeposit reuse within the same proposal:
+a replacement DAO deposit created after the Proposal Cell is ineligible.
 
 ## Batch witness verification
 
-A batch contains only relevant historical events: compact VoteEvent proofs and
-raw transactions that spend a currently tracked DAO outpoint. Events are grouped by block. Each
-block group carries:
+A batch contains only compact VoteEvent proofs, grouped by block. Each block
+group carries:
 
 - block number, `header_dep` index, total transaction count, and witnesses root;
 - strictly increasing transaction indices; each vote carries a VoteEventCell
   outpoint, direct CellDep index, voter lock hash, and canonical VoteData;
-- a serialized RawTransaction only when the event spends a tracked DAO outpoint;
 - one CBMT multiproof shared by all included transactions from that block.
 
 The contract performs the following checks:
 
 1. Load each referenced header once and match its block number.
-2. Derive a vote transaction hash from its immutable VoteEventCell outpoint, or
-   hash the raw DAO-spend transaction. For a mixed vote/spend event, require both
-   hashes to match. Verify the block-level CBMT multiproof with each hash bound
-   to its strictly ordered transaction index.
+2. Derive each vote transaction hash from its immutable VoteEventCell outpoint.
+   Verify the block-level CBMT multiproof with each hash bound to its strictly
+   ordered transaction index.
 3. Combine the computed raw-transaction root and supplied witnesses root, then
    require the result to equal the header's `transactions_root`.
 4. Verify one compiled SMT proof against both the old and new unified roots for
@@ -180,17 +173,17 @@ The contract performs the following checks:
 5. Re-run the reducer in `(block_number, tx_index)` order.
 6. Load every referenced VoteEventCell from a direct CellDep and require its
    configured Vote Type, proposal args, lock hash, and data to match the proof.
-7. Require the recomputed leaf values, totals, event count, cursor, roots, and next
-   phase to equal the output TallySession.
+7. Require the recomputed leaf values, totals, event count, cursor, root, and next
+   phase to equal the output TallyChainCell.
 
 ```mermaid
 flowchart TD
     W["Offline builder emits batch witness"] --> H["Load header_dep"]
     H --> M["Verify block CBMT multiproof"]
     M --> O["Verify old unified SMT root"]
-    O --> D["Apply ordered revote and DAO-spend reducer"]
+    O --> D["Apply ordered vote/revote reducer"]
     D --> N["Verify new unified SMT root and yes/no totals"]
-    N --> Q["Create next TallySession"]
+    N --> Q["Create next TallyChainCell"]
 ```
 
 The proposal fixes `max_events_per_batch`, `max_dao_deps_per_vote`,
@@ -200,13 +193,12 @@ Tally witness byte length is checked before decoding variable-length proof and
 event vectors, so an oversized witness cannot force allocations before the
 configured limit is applied.
 
-VoteEvent and DAO dependencies must precede any DepGroup in a tally transaction,
+VoteEvent dependencies must precede any DepGroup in a tally transaction,
 so the proof's raw CellDep index is also the resolved `Source::CellDep` index.
 Standard lock DepGroups may follow this direct-dependency prefix.
 
-An empty batch is valid only when it preserves the unified root in all three
-layout fields, both tally totals, and carries no transitions, prior records, or
-SMT proofs. This lets a
+An empty batch is valid only when it preserves `state_root`, both tally totals,
+and carries no transitions, prior records, or SMT proofs. This lets a
 no-vote proposal, or an empty suffix of a voting window, reach `FinalCandidate`
 without granting the operator any ability to alter state.
 
@@ -217,8 +209,8 @@ canonical block in serialized Molecule form, recomputes the raw-transaction and
 witness CBMT roots, checks them against the header, and scans transactions in
 chain order. The builder receives the same decoded Proposal Config used by the
 contracts and recognizes Vote scripts only through its authorized identity.
-Temporary vote and DAO state is carried across blocks, so a DAO
-deposit spent in a later block removes a vote found earlier in the same batch.
+Temporary vote and event state is carried across blocks. DAO spends are ignored
+because eligibility is finalized when the VoteEventCell is created.
 Consecutive RPC blocks must also form one parent-hash chain; a reorg during a
 scan causes an immediate retry instead of producing a mixed-branch batch.
 
@@ -235,22 +227,14 @@ the operator submitted every relevant event. Intermediate batches therefore do
 not wait for a challenge period. The complete event namespace is challenged only
 after the final cursor is reached.
 
-Two V5 challenges are supported:
+V6 supports one challenge:
 
 - **Omitted vote**: load the immutable VoteEventCell, prove its transaction hash
   is included at the claimed block position, and prove that hash is absent from
   the event namespace. The raw VoteTx is not included.
-- **Omitted DAO spend**: prove that the final DAO namespace still maps an outpoint
-  to a nonzero voter, prove a transaction in the voting window spends that
-  outpoint, and prove the spend transaction is absent from the event namespace. This
-  final-state condition prevents an obsolete outpoint from an earlier,
-  superseded vote from producing a false challenge.
-
 The compact path removes the malicious oversized-VoteTx witness problem because
 unrelated VoteTx inputs, outputs, and cell deps are not copied into settlement.
-DAO-spend raw transactions remain necessary for deposit-liveness checks. A
-block-sized DAO-spend transaction is therefore a separate residual sizing risk,
-not something V5 claims to eliminate.
+No DAO-spend RawTransaction is copied into settlement.
 
 A successful challenge consumes the candidate and pays its entire bond to the
 challenge transaction sender. CKB transactions have no native sender field, so
